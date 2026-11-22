@@ -1,0 +1,1455 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Dial Tone</title>
+<style>
+:root{color-scheme:dark}
+html,body{height:100%}
+body{margin:0;background:#000;color:#000;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;overscroll-behavior:none}
+#stage{position:fixed;left:0;top:0;right:0;bottom:0;background:#000;overflow:hidden}
+#stage canvas{position:absolute;display:block;image-rendering:-moz-crisp-edges;image-rendering:crisp-edges;image-rendering:pixelated}
+#bg{z-index:1;left:0;top:0}
+#scene{z-index:2}
+#ov{z-index:3;left:0;top:0;pointer-events:none}
+</style>
+<div id="stage">
+  <canvas id="bg"></canvas>
+  <canvas id="scene"></canvas>
+  <canvas id="ov"></canvas>
+</div>
+<script>
+/* Memory: everything the phone remembers about the visitor lives here (localStorage). */
+(function (P) {
+  'use strict';
+  var KEY = 'rp.memory.v1', mem = null;
+  function read() { try { var s = localStorage.getItem(KEY); return s ? JSON.parse(s) : null; } catch (e) { return null; } }
+  function write() { try { localStorage.setItem(KEY, JSON.stringify(mem)); } catch (e) {} }
+  mem = read();
+  if (!mem || typeof mem !== 'object' || !mem.counts) {
+    mem = { v: 1, first: Date.now(), visits: 0, last: 0, counts: {}, stamps: {}, log: [], flags: {} };
+  }
+  var prevVisit = mem.last || 0;
+  mem.visits = (mem.visits || 0) + 1;
+  mem.last = Date.now();
+  write();
+
+  P.mem = {
+    data: mem,
+    prevVisit: prevVisit,
+    returning: mem.visits > 1,
+    save: write,
+    count: function (n) { return mem.counts[n] || 0; },
+    total: function () { var t = 0; for (var k in mem.counts) t += mem.counts[k]; return t; },
+    distinct: function () { return Object.keys(mem.counts).length; },
+    record: function (n) {
+      var s = mem.stamps[n] || (mem.stamps[n] = { first: Date.now(), last: 0 });
+      s.prev = s.last; s.last = Date.now();
+      mem.counts[n] = (mem.counts[n] || 0) + 1;
+      mem.log.push([n, Date.now()]);
+      if (mem.log.length > 120) mem.log.splice(0, mem.log.length - 120);
+      mem.last = Date.now();
+      write();
+    },
+    sinceLast: function (n) { var s = mem.stamps[n]; return s && s.prev ? Date.now() - s.prev : Infinity; },
+    flag: function (k, v) { if (v === undefined) return mem.flags[k]; if (v === null) delete mem.flags[k]; else mem.flags[k] = v; write(); },
+    bump: function (k, by) { mem.flags[k] = (mem.flags[k] || 0) + (by || 1); write(); return mem.flags[k]; },
+    // recent(0) = most recent recorded call, recent(1) = the one before it...
+    recent: function (i) { var l = mem.log; return l.length > i ? l[l.length - 1 - i][0] : null; },
+    lastCalls: function (k) { return mem.log.slice(-k).map(function (e) { return e[0]; }); },
+    daysAway: function () { return prevVisit ? (Date.now() - prevVisit) / 864e5 : 0; }
+  };
+})(window.P = window.P || {});
+
+</script>
+<script>
+/* Audio: everything is synthesized with WebAudio (no asset files), voices use speechSynthesis. */
+(function (P) {
+  'use strict';
+  var AC = window.AudioContext || window.webkitAudioContext;
+  var ctx = null, master, out, line, noiseBuf;
+  var live = new Set(), speaking = new Set(), voices = [];
+
+  function init() {
+    if (ctx || !AC) return;
+    try {
+      ctx = new AC();
+      var comp = ctx.createDynamicsCompressor();
+      master = ctx.createGain(); master.gain.value = 0.85;
+      master.connect(comp); comp.connect(ctx.destination);
+      out = ctx.createGain(); out.gain.value = 1; out.connect(master);
+      var hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 260;
+      var lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 3600;
+      line = ctx.createGain(); line.gain.value = 1; line.connect(hp); hp.connect(lp); lp.connect(master);
+      var n = ctx.sampleRate * 2;
+      noiseBuf = ctx.createBuffer(1, n, ctx.sampleRate);
+      var d = noiseBuf.getChannelData(0);
+      for (var i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+    } catch (e) { ctx = null; }
+    try { if (window.speechSynthesis) { var u = new SpeechSynthesisUtterance(' '); u.volume = 0; speechSynthesis.speak(u); } } catch (e) {}
+  }
+  function resume() { if (ctx && ctx.state === 'suspended') { try { ctx.resume(); } catch (e) {} } }
+  function now() { return ctx ? ctx.currentTime : 0; }
+  function mk(stop) {
+    var h = { stop: function () { if (h.done) return; h.done = true; live.delete(h); try { stop(); } catch (e) {} } };
+    live.add(h); return h;
+  }
+  function env(g, t, a, peak, dec) {
+    g.gain.cancelScheduledValues(t);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(peak, t + a);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + a + dec);
+  }
+  function noiseSrc(loop) {
+    var s = ctx.createBufferSource(); s.buffer = noiseBuf; s.loop = !!loop;
+    if (loop) { s.loopStart = Math.random() * 0.5; s.loopEnd = 1.9; }
+    return s;
+  }
+  function burst(o) {
+    if (!ctx) return;
+    var t = now() + (o.t || 0), dur = o.dur || 0.03, s = noiseSrc(false), f = ctx.createBiquadFilter(), g = ctx.createGain();
+    f.type = o.type || 'bandpass'; f.frequency.value = o.f || 1500; f.Q.value = o.q || 1;
+    s.connect(f); f.connect(g); g.connect(o.dest || out);
+    env(g, t, 0.001, o.gain || 0.3, dur);
+    s.start(t, Math.random() * 1.5, dur + 0.05);
+  }
+  function blip(o) {
+    if (!ctx) return;
+    var t = now() + (o.t || 0), dur = o.dur || 0.1, a = o.a || 0.002, os = ctx.createOscillator(), g = ctx.createGain();
+    os.type = o.type || 'sine';
+    os.frequency.setValueAtTime(o.f, t);
+    if (o.f2) os.frequency.exponentialRampToValueAtTime(o.f2, t + dur);
+    os.connect(g); g.connect(o.dest || out);
+    env(g, t, a, o.gain || 0.2, dur);
+    os.start(t); os.stop(t + dur + a + 0.05);
+  }
+  function mtof(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+
+  /* --- mechanical sounds --- */
+  function tick(v) { v = v || 1; burst({ f: 2600, q: 3, dur: 0.012, gain: 0.2 * v }); blip({ f: 190, f2: 90, dur: 0.03, gain: 0.16 * v, type: 'triangle' }); }
+  function click(v) { v = v || 1; burst({ f: 3800, q: 2, dur: 0.008, gain: 0.3 * v }); burst({ t: 0.012, f: 1800, q: 2, dur: 0.01, gain: 0.18 * v }); }
+  function ratchet(v) { burst({ f: 1500, q: 4, dur: 0.006, gain: 0.05 * (v || 1) }); }
+  function thunk(v) {
+    v = v || 1;
+    burst({ type: 'lowpass', f: 500, dur: 0.12, gain: 0.5 * v });
+    blip({ f: 110, f2: 48, dur: 0.16, gain: 0.5 * v });
+    burst({ t: 0.01, f: 2500, q: 2, dur: 0.02, gain: 0.2 * v });
+  }
+  function bellPing(v) { v = v || 1; [2093, 3136, 4186].forEach(function (f, i) { blip({ t: 0.02 * i, f: f, dur: 0.35, gain: 0.04 * v / (i + 1) }); }); }
+  function pickup() { thunk(0.8); setTimeout(function () { burst({ f: 900, q: 1, dur: 0.05, gain: 0.15 }); }, 60); bellPing(0.6); }
+  function hangup() { thunk(1); bellPing(1.2); }
+  function slide() { burst({ type: 'lowpass', f: 700, dur: 0.18, gain: 0.08 }); }
+
+  /* --- continuous / long sounds (return a handle with .stop()) --- */
+  function ring(ms) {
+    if (!ctx) return mk(function () {});
+    var t = now(), dur = (ms || 1200) / 1000;
+    var eg = ctx.createGain(); eg.gain.value = 0; eg.connect(out);
+    var g = ctx.createGain(); g.gain.value = 0.5; g.connect(eg);
+    var oss = [1180, 1490, 2280].map(function (fr, i) {
+      var o = ctx.createOscillator(); o.frequency.value = fr;
+      var og = ctx.createGain(); og.gain.value = 0.16 / (i + 1);
+      o.connect(og); og.connect(g); o.start(t); return o;
+    });
+    var lfo = ctx.createOscillator(); lfo.type = 'square'; lfo.frequency.value = 19;
+    var lg = ctx.createGain(); lg.gain.value = 0.5; lfo.connect(lg); lg.connect(g.gain); lfo.start(t);
+    eg.gain.setTargetAtTime(1, t, 0.005);
+    eg.gain.setTargetAtTime(0, t + dur, 0.015);
+    var h = mk(function () {
+      eg.gain.cancelScheduledValues(now()); eg.gain.setTargetAtTime(0, now(), 0.01);
+      setTimeout(function () { oss.concat([lfo]).forEach(function (o) { try { o.stop(); } catch (e) {} }); }, 120);
+    });
+    setTimeout(function () { h.stop(); }, dur * 1000 + 200);
+    return h;
+  }
+  function cadence(freqs, on, off, vol, dest) {
+    if (!ctx) return mk(function () {});
+    var g = ctx.createGain(); g.gain.value = 0; g.connect(dest || line);
+    var oss = freqs.map(function (f) {
+      var o = ctx.createOscillator(); o.frequency.value = f;
+      var og = ctx.createGain(); og.gain.value = vol / freqs.length;
+      o.connect(og); og.connect(g); o.start(); return o;
+    });
+    var iv = null;
+    function cyc() {
+      var t = now(); g.gain.cancelScheduledValues(t);
+      g.gain.setTargetAtTime(1, t, 0.005);
+      if (off > 0) g.gain.setTargetAtTime(0, t + on / 1000, 0.005);
+    }
+    cyc(); if (off > 0) iv = setInterval(cyc, on + off);
+    return mk(function () {
+      clearInterval(iv);
+      var t = now(); g.gain.cancelScheduledValues(t); g.gain.setTargetAtTime(0, t, 0.01);
+      setTimeout(function () { oss.forEach(function (o) { try { o.stop(); } catch (e) {} }); try { g.disconnect(); } catch (e) {} }, 150);
+    });
+  }
+  function dialTone() { return cadence([350, 440], 1, 0, 0.14); }
+  function ringback() { return cadence([440, 480], 2000, 4000, 0.14); }
+  function busy() { return cadence([480, 620], 500, 500, 0.14); }
+  function reorder() { return cadence([480, 620], 250, 250, 0.14); }
+  function sit() {
+    blip({ f: 913.8, dur: 0.27, gain: 0.14, dest: line });
+    blip({ t: 0.3, f: 1370.6, dur: 0.27, gain: 0.14, dest: line });
+    blip({ t: 0.6, f: 1776.7, dur: 0.38, gain: 0.14, dest: line });
+  }
+  function hiss(level, o) {
+    if (!ctx) return mk(function () {});
+    o = o || {};
+    var s = noiseSrc(true), f = ctx.createBiquadFilter(), g = ctx.createGain();
+    f.type = 'bandpass'; f.frequency.value = o.f || 2000; f.Q.value = o.q || 0.4;
+    g.gain.value = 0; s.connect(f); f.connect(g); g.connect(o.dest || line); s.start();
+    g.gain.setTargetAtTime(level, now(), 0.05);
+    var h = mk(function () { g.gain.setTargetAtTime(0, now(), 0.05); setTimeout(function () { try { s.stop(); } catch (e) {} }, 400); });
+    h.set = function (l) { g.gain.setTargetAtTime(l, now(), 0.05); };
+    h.filter = f; return h;
+  }
+  function crackle(rate, vol) {
+    var iv = setInterval(function () {
+      if (Math.random() < rate) burst({ f: 1000 + Math.random() * 4000, q: 1, dur: 0.004 + Math.random() * 0.01, gain: (vol || 0.1) * Math.random(), dest: line });
+    }, 40);
+    return mk(function () { clearInterval(iv); });
+  }
+  function drone(freqs, vol, o) {
+    if (!ctx) return mk(function () {});
+    o = o || {};
+    var g = ctx.createGain(); g.gain.value = 0; g.connect(o.dest || out);
+    var lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.lp || 600; lp.connect(g);
+    var oss = freqs.map(function (f, i) {
+      var os = ctx.createOscillator(); os.type = o.type || 'sawtooth'; os.frequency.value = f; os.detune.value = (i % 2 ? 1 : -1) * (o.detune || 6);
+      os.connect(lp); os.start(); return os;
+    });
+    var lfo = ctx.createOscillator(); lfo.frequency.value = o.lfo || 0.15;
+    var lg = ctx.createGain(); lg.gain.value = (o.lp || 600) * 0.4; lfo.connect(lg); lg.connect(lp.frequency); lfo.start();
+    g.gain.setTargetAtTime(vol, now(), (o.fade || 2) / 3);
+    var h = mk(function () {
+      g.gain.setTargetAtTime(0, now(), 0.4);
+      setTimeout(function () { oss.concat([lfo]).forEach(function (x) { try { x.stop(); } catch (e) {} }); try { g.disconnect(); } catch (e) {} }, 2500);
+    });
+    h.freq = function (mult, secs) { oss.forEach(function (os, i) { os.frequency.setTargetAtTime(freqs[i] * mult, now(), secs || 1); }); };
+    return h;
+  }
+  function seq(notes, stepMs, fn) {
+    var i = 0, stopped = false, tm = null, h;
+    function next() {
+      if (stopped || i >= notes.length) { h && h.stop(); return; }
+      var n = notes[i++]; if (n != null) fn(n, i - 1);
+      tm = setTimeout(next, typeof stepMs === 'function' ? stepMs(i) : stepMs);
+    }
+    h = mk(function () { stopped = true; clearTimeout(tm); });
+    next(); return h;
+  }
+  function musicBox(midi, stepMs, vol, detune) {
+    vol = vol || 0.12;
+    return seq(midi, stepMs, function (m, i) {
+      var f = mtof(m) * (detune ? 1 + (Math.random() - 0.5) * detune : 1);
+      blip({ f: f, dur: 0.9, gain: vol, type: 'sine', dest: out });
+      blip({ f: f * 2.76, dur: 0.25, gain: vol * 0.25, dest: out });
+    });
+  }
+  function sweep(f0, f1, dur, vol, type) { blip({ f: f0, f2: f1, dur: dur, gain: vol || 0.15, type: type || 'sine', a: Math.min(0.05, dur / 4) }); }
+  function boom(v) { v = v || 1; blip({ f: 70, f2: 28, dur: 1.4, gain: 0.7 * v }); burst({ type: 'lowpass', f: 300, dur: 1.2, gain: 0.5 * v }); }
+  function heartbeat(bpm, vol) {
+    var iv = setInterval(function () {
+      blip({ f: 62, f2: 40, dur: 0.14, gain: vol || 0.5 });
+      setTimeout(function () { blip({ f: 54, f2: 38, dur: 0.12, gain: (vol || 0.5) * 0.7 }); }, 190);
+    }, 60000 / (bpm || 60));
+    return mk(function () { clearInterval(iv); });
+  }
+  var DT = { '1': [697, 1209], '2': [697, 1336], '3': [697, 1477], '4': [770, 1209], '5': [770, 1336], '6': [770, 1477], '7': [852, 1209], '8': [852, 1336], '9': [852, 1477], '0': [941, 1336] };
+  function dtmf(digits, vol) {
+    String(digits).split('').forEach(function (d, i) {
+      var p = DT[d]; if (!p) return;
+      blip({ t: i * 0.16, f: p[0], dur: 0.1, gain: (vol || 0.1), dest: line });
+      blip({ t: i * 0.16, f: p[1], dur: 0.1, gain: (vol || 0.1), dest: line });
+    });
+  }
+  var MORSE = { a: '.-', b: '-...', c: '-.-.', d: '-..', e: '.', f: '..-.', g: '--.', h: '....', i: '..', j: '.---', k: '-.-', l: '.-..', m: '--', n: '-.', o: '---', p: '.--.', q: '--.-', r: '.-.', s: '...', t: '-', u: '..-', v: '...-', w: '.--', x: '-..-', y: '-.--', z: '--..' };
+  function morse(text, unit) {
+    unit = unit || 0.08; var t = 0;
+    text.toLowerCase().split('').forEach(function (ch) {
+      if (ch === ' ') { t += unit * 4; return; }
+      (MORSE[ch] || '').split('').forEach(function (s) {
+        var d = s === '.' ? unit : unit * 3;
+        blip({ t: t, f: 700, dur: d, gain: 0.12, a: 0.004, dest: line }); t += d + unit;
+      });
+      t += unit * 2;
+    });
+    return t * 1000;
+  }
+  function modem(ms) {
+    var t = 0;
+    while (t < ms / 1000) {
+      blip({ t: t, f: 1200 + Math.random() * 1200, f2: 600 + Math.random() * 2400, dur: 0.09, gain: 0.06, type: 'square', dest: line });
+      burst({ t: t, f: 1500 + Math.random() * 2000, q: 2, dur: 0.07, gain: 0.08, dest: line });
+      t += 0.07 + Math.random() * 0.06;
+    }
+  }
+
+  /* --- voices --- */
+  function loadVoices() { try { voices = speechSynthesis.getVoices() || []; } catch (e) { voices = []; } }
+  if (window.speechSynthesis) { loadVoices(); try { speechSynthesis.onvoiceschanged = loadVoices; } catch (e) {} }
+  var FEM = /samantha|victoria|karen|moira|tessa|fiona|zira|female|susan|hazel|jenny|aria|serena|allison|ava|kate|luciana|francisca|maria/i;
+  var MAL = /daniel|alex|fred|david|mark|george|male|oliver|guy|tom|aaron|ricardo|felipe|thomas/i;
+  function pick(kind, lang) {
+    var list = voices.filter(function (v) { return v.lang && v.lang.toLowerCase().indexOf(lang) === 0; });
+    if (!list.length) return null;
+    var re = kind === 'f' ? FEM : MAL, hit = list.filter(function (v) { return re.test(v.name); });
+    return hit[0] || list[0];
+  }
+  var PRESETS = { f: [1, 0.92, 'f'], m: [0.8, 0.9, 'm'], kid: [1.9, 1.05, 'f'], old: [0.55, 0.78, 'm'], robot: [0.25, 1.0, 'm'], whisper: [0.9, 0.8, 'f'], deep: [0.1, 0.7, 'm'] };
+  function babble(text) {
+    if (!ctx) return;
+    var words = text.split(/\s+/), t = 0;
+    words.forEach(function (w) {
+      var os = ctx.createOscillator(), bp = ctx.createBiquadFilter(), g = ctx.createGain(), s = now() + t, d = Math.min(0.5, 0.06 * w.length + 0.05);
+      os.type = 'sawtooth'; os.frequency.value = 95 + Math.random() * 70;
+      bp.type = 'bandpass'; bp.Q.value = 4; bp.frequency.setValueAtTime(500 + Math.random() * 600, s); bp.frequency.linearRampToValueAtTime(900 + Math.random() * 1200, s + d);
+      os.connect(bp); bp.connect(g); g.connect(line); env(g, s, 0.02, 0.1, d);
+      os.start(s); os.stop(s + d + 0.1); t += d + 0.07;
+    });
+  }
+  function say(text, o) {
+    o = o || {};
+    return new Promise(function (resolve) {
+      var done = false, started = false, lh = null, wd, fb;
+      function fin() {
+        if (done) return; done = true; clearTimeout(wd); clearTimeout(fb); speaking.delete(fin);
+        if (lh) lh.stop(); resolve();
+      }
+      speaking.add(fin);
+      if (ctx && o.line !== false) lh = hiss(o.noise || 0.01);
+      var est = Math.max(900, text.length * 88 / (o.rate || 1) + 800);
+      wd = setTimeout(fin, est + 5000);
+      if (!window.speechSynthesis || typeof SpeechSynthesisUtterance === 'undefined') {
+        if (P.fx) P.fx.caption(text); babble(text); setTimeout(fin, est); return;
+      }
+      try {
+        var u = new SpeechSynthesisUtterance(text), p = PRESETS[o.who || 'f'] || PRESETS.f, lang = o.lang || 'en';
+        u.pitch = o.pitch != null ? o.pitch : p[0];
+        u.rate = o.rate != null ? o.rate : p[1];
+        u.volume = o.vol != null ? o.vol : (o.who === 'whisper' ? 0.45 : 1);
+        var v = pick(p[2], lang);
+        if (v) { u.voice = v; u.lang = v.lang; } else u.lang = lang === 'pt' ? 'pt-BR' : 'en-US';
+        u.onstart = function () { started = true; };
+        u.onend = fin; u.onerror = fin;
+        fb = setTimeout(function () { if (!started && !done && P.fx) { P.fx.caption(text); babble(text); } }, 2600);
+        speechSynthesis.speak(u);
+      } catch (e) { if (P.fx) P.fx.caption(text); babble(text); setTimeout(fin, est); }
+    });
+  }
+  function killAll() {
+    live.forEach(function (h) { h.stop(); });
+    try { if (window.speechSynthesis) speechSynthesis.cancel(); } catch (e) {}
+    speaking.forEach(function (f) { f(); });
+  }
+
+  P.audio = {
+    init: init, resume: resume, ready: function () { return !!ctx; },
+    get line() { return line; }, get out() { return out; }, now: now,
+    tick: tick, click: click, ratchet: ratchet, thunk: thunk, pickup: pickup, hangup: hangup, slide: slide, bellPing: bellPing,
+    ring: ring, cadence: cadence, dialTone: dialTone, ringback: ringback, busy: busy, reorder: reorder, sit: sit,
+    hiss: hiss, crackle: crackle, drone: drone, musicBox: musicBox, seq: seq, sweep: sweep, boom: boom, heartbeat: heartbeat,
+    dtmf: dtmf, morse: morse, modem: modem, blip: blip, burst: burst, mtof: mtof, say: say, killAll: killAll
+  };
+})(window.P = window.P || {});
+
+</script>
+<script>
+/* Shade: builds "photographic" sprites by lighting analytic height fields per pixel
+   (soft-box reflections, specular, ambient occlusion, plastic grain). The scene canvas is tiny,
+   so everything ends up honestly pixelated. */
+(function (P) {
+  'use strict';
+  var G = P.G = {
+    W: 200, dial: { x: 100, y: 118 }, jack: { x: 36, y: 140 }, floor: 164,
+    rest: { x: 100, y: 57, a: 0 }, held: { x: 150, y: 76, a: 1.15 },
+    stopDeg: 120, cord: 140,
+    rot: function (n) { return 35 + 28 * (n - 1); },          // degrees the wheel must turn for digit n (10 = zero)
+    holeDeg: function (n) { return 120 - (35 + 28 * (n - 1)); } // clockwise-from-up angle of hole n at rest
+  };
+  function hash(x, y) { var h = Math.sin(x * 127.1 + y * 311.7) * 43758.5453; return h - Math.floor(h); }
+  function vn(x, y) {
+    var xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+    xf = xf * xf * (3 - 2 * xf); yf = yf * yf * (3 - 2 * yf);
+    var a = hash(xi, yi), b = hash(xi + 1, yi), c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+    return a + (b - a) * xf + (c - a) * yf + (a - b - c + d) * xf * yf;
+  }
+  function sm(e0, e1, x) { var t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0))); return t * t * (3 - 2 * t); }
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+  function blur(src, w, h, r) {
+    var tmp = new Float32Array(w * h), dst = new Float32Array(w * h), n = 2 * r + 1, x, y, s;
+    for (y = 0; y < h; y++) {
+      s = 0; for (x = -r; x <= r; x++) s += src[y * w + clamp(x, 0, w - 1)];
+      for (x = 0; x < w; x++) { tmp[y * w + x] = s / n; s += src[y * w + Math.min(w - 1, x + r + 1)] - src[y * w + Math.max(0, x - r)]; }
+    }
+    for (x = 0; x < w; x++) {
+      s = 0; for (y = -r; y <= r; y++) s += tmp[clamp(y, 0, h - 1) * w + x];
+      for (y = 0; y < h; y++) { dst[y * w + x] = s / n; s += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x]; }
+    }
+    return dst;
+  }
+  function nrm(h, w, hh, x, y, k) {
+    var xl = h[y * w + Math.max(0, x - 1)], xr = h[y * w + Math.min(w - 1, x + 1)];
+    var yu = h[Math.max(0, y - 1) * w + x], yd = h[Math.min(hh - 1, y + 1) * w + x];
+    var nx = -(xr - xl) * 0.5 * k, ny = -(yd - yu) * 0.5 * k, m = Math.sqrt(nx * nx + ny * ny + 1);
+    return [nx / m, ny / m, 1 / m];
+  }
+  var L = (function () { var x = -0.5, y = -0.72, z = 0.55, m = Math.sqrt(x * x + y * y + z * z); return [x / m, y / m, z / m]; })();
+  var Hv = (function () { var x = L[0], y = L[1], z = L[2] + 1, m = Math.sqrt(x * x + y * y + z * z); return [x / m, y / m, z / m]; })();
+  function softbox(rx, ry, cx, cy, wd) { var d = Math.sqrt((rx - cx) * (rx - cx) + (ry - cy) * (ry - cy)); return sm(wd, wd * 0.35, d); }
+  function plastic(n, al, amb, ao) {
+    var d = Math.max(0, n[0] * L[0] + n[1] * L[1] + n[2] * L[2]);
+    var s = Math.pow(Math.max(0, n[0] * Hv[0] + n[1] * Hv[1] + n[2] * Hv[2]), 70);
+    var rx = 2 * n[2] * n[0], ry = 2 * n[2] * n[1];
+    var sb = softbox(rx, ry, -0.4, -0.6, 0.5);
+    var fres = 0.05 + 0.95 * Math.pow(1 - n[2], 4);
+    var rim = softbox(rx, ry, 0.75, 0.35, 0.4) * (0.1 + fres * 0.5);
+    var k = (amb + 0.95 * d) * ao, hl = 255 * (s * 0.5 + sb * (0.2 + fres * 0.9));
+    return [al[0] * k + hl + 40 * rim, al[1] * k + hl * 0.96 + 55 * rim, al[2] * k + hl * 0.96 + 90 * rim];
+  }
+  function chrome(n, dim) {
+    var rx = 2 * n[2] * n[0], ry = 2 * n[2] * n[1];
+    var v = 0.07 + 1.0 * softbox(rx, ry, -0.45, -0.55, 0.55) + 0.4 * softbox(rx, ry, 0.6, 0.5, 0.35) + 0.14 * (1 - n[2]) + 0.12 * softbox(rx, ry, 0, 0.9, 0.5);
+    v = Math.min(1.15, v) * (dim || 1);
+    return [v * 232, v * 236, v * 246];
+  }
+  function toCanvas(w, h, data) { var cv = document.createElement('canvas'); cv.width = w; cv.height = h; var c = cv.getContext('2d'); c.putImageData(data, 0, 0); return cv; }
+
+  /* ---------- the telephone base ---------- */
+  function buildBase() {
+    var W = G.W, H = W, DX = G.dial.x, DY = G.dial.y, hf = new Float32Array(W * H), mat = new Uint8Array(W * H), x, y, i;
+    var yt = 68, yb = 166, cx = 100, Bv = 16, Hh = 14;
+    var sa = G.stopDeg * Math.PI / 180, ax = DX + Math.sin(sa) * 36, ay = DY - Math.cos(sa) * 36, bx = DX + Math.sin(sa) * 46, by = DY - Math.cos(sa) * 46;
+    for (y = 0; y < H; y++) for (x = 0; x < W; x++) {
+      i = y * W + x;
+      var t = clamp((y - yt) / (yb - yt), 0, 1), hw = 52 + 20 * t;
+      var dx = hw - Math.abs(x - cx), dy = Math.min(y - yt, yb - y), R = 18, d;
+      if (dx < R && dy < R) d = R - Math.hypot(R - dx, R - dy); else d = Math.min(dx, dy);
+      var hgt = d > 0 ? Hh * (1 - Math.pow(1 - clamp(d / Bv, 0, 1), 2)) + 6 * (1 - t) : 0, m = d > 0 ? 1 : 0;
+      for (var s = 0; s < 2; s++) {
+        var sx = s ? 145 : 55, qx = (x - sx) / 22, qy = (y - 70) / 9, q = qx * qx + qy * qy;
+        if (q < 1) { var sh = Hh + 5 + 7 * Math.pow(1 - q, 0.55); if (sh > hgt) hgt = sh; m = 1; }
+      }
+      var r = Math.hypot(x - DX, y - DY);
+      if (m) {
+        if (r < 38) hgt -= 6 * clamp((38 - r) / 3, 0, 1);
+        if (r < 37.2 && r > 30.8) { var tt = (r - 34) / 3.2; hgt = Math.max(hgt, Hh - 2 + 3.4 * Math.sqrt(Math.max(0, 1 - tt * tt))); mat[i] = 2; }
+        else if (r <= 30.8) mat[i] = 3;
+        // finger stop capsule
+        var ex = bx - ax, ey = by - ay, tp = clamp(((x - ax) * ex + (y - ay) * ey) / (ex * ex + ey * ey), 0, 1), dd = Math.hypot(x - (ax + ex * tp), y - (ay + ey * tp));
+        if (dd < 2.7) { hgt = Math.max(hgt, Hh + 1 + 2.6 * Math.sqrt(1 - (dd / 2.7) * (dd / 2.7))); mat[i] = 2; }
+      }
+      if (m && mat[i] === 0) hgt += (vn(x * 0.7, y * 0.7) - 0.5) * 0.5;
+      hf[i] = m ? hgt : 0; if (!m) mat[i] = 255;
+    }
+    var bl = blur(hf, W, H, 4);
+    var im = new ImageData(W, H), o = im.data, red = [196, 20, 24];
+    for (y = 0; y < H; y++) for (x = 0; x < W; x++) {
+      i = y * W + x; if (mat[i] === 255) continue;
+      var n = nrm(hf, W, H, x, y, 1.0), c, g = (hash(x, y) - 0.5) * 7;
+      var ao = 1 - clamp((bl[i] - hf[i]) * 0.1, 0, 0.55);
+      if (mat[i] === 2) c = chrome(n);
+      else if (mat[i] === 3) {
+        var rr = Math.hypot(x - DX, y - DY), v = 1 - 0.38 * sm(21, 30.5, rr) + 0.07 * ((DX - x) + (DY - y)) / 30;
+        c = [226 * v, 215 * v, 186 * v];
+      } else c = plastic(n, red, 0.16, ao);
+      o[i * 4] = clamp(c[0] + g, 0, 255); o[i * 4 + 1] = clamp(c[1] + g, 0, 255); o[i * 4 + 2] = clamp(c[2] + g, 0, 255); o[i * 4 + 3] = 255;
+    }
+    var cv = toCanvas(W, H, im), c2 = cv.getContext('2d');
+    // numerals on the fixed card (seen through the finger holes)
+    c2.font = 'bold 6px Georgia, serif'; c2.textAlign = 'center'; c2.textBaseline = 'middle'; c2.fillStyle = '#2a2217';
+    for (var k = 1; k <= 10; k++) {
+      var a = G.holeDeg(k) * Math.PI / 180;
+      c2.fillText(k === 10 ? '0' : String(k), DX + Math.sin(a) * 21.5, DY - Math.cos(a) * 21.5 + 0.5);
+    }
+    // dust and tiny scratches on the glossy red
+    c2.globalCompositeOperation = 'source-atop';
+    for (i = 0; i < 70; i++) { c2.fillStyle = 'rgba(255,235,225,' + (0.04 + Math.random() * 0.08) + ')'; c2.fillRect(40 + Math.random() * 120, 70 + Math.random() * 94, 1, 1); }
+    return cv;
+  }
+
+  /* ---------- the handset (drawn horizontally, centred in a 160x48 sprite) ---------- */
+  function buildHandset() {
+    var w = 160, h = 48, hf = new Float32Array(w * h), m = new Uint8Array(w * h), x, y, i;
+    for (y = 0; y < h; y++) for (x = 0; x < w; x++) {
+      i = y * w + x; var lx = x - 80, ly = y - 24, a = 0, b = 0;
+      [-60, 60].forEach(function (cx) { var q = (lx - cx) * (lx - cx) / 169 + ly * ly / 144; if (q < 1) a = Math.max(a, 12 * Math.pow(1 - q, 0.38)); });
+      var cy = 5 * (1 - Math.pow(lx / 62, 2)), rh = 5.8 + 1.6 * Math.pow(Math.abs(lx) / 56, 3), dd = Math.abs(ly - cy);
+      if (Math.abs(lx) < 64 && dd < rh) b = 6.8 * Math.sqrt(1 - (dd / rh) * (dd / rh));
+      if (a > 0 || b > 0) { m[i] = 1; hf[i] = (a > 0 && b > 0) ? (a + b + Math.sqrt((a - b) * (a - b) + 4)) / 2 - 1 : Math.max(a, b); hf[i] += (vn(x * 0.7, y * 0.7) - 0.5) * 0.35; }
+    }
+    var bl = blur(hf, w, h, 3), im = new ImageData(w, h), o = im.data, red = [208, 24, 28];
+    for (y = 0; y < h; y++) for (x = 0; x < w; x++) {
+      i = y * w + x; if (!m[i]) continue;
+      var n = nrm(hf, w, h, x, y, 1.0), ao = 1 - clamp((bl[i] - hf[i]) * 0.14, 0, 0.5), c = plastic(n, red, 0.18, ao), g = (hash(x, y) - 0.5) * 7;
+      o[i * 4] = clamp(c[0] + g, 0, 255); o[i * 4 + 1] = clamp(c[1] + g, 0, 255); o[i * 4 + 2] = clamp(c[2] + g, 0, 255); o[i * 4 + 3] = 255;
+    }
+    return toCanvas(w, h, im);
+  }
+
+  /* ---------- the finger wheel (64x64, holes are transparent) ---------- */
+  function buildWheel() {
+    var w = 64, c0 = 32, hf = new Float32Array(w * w), m = new Uint8Array(w * w), x, y, i, holes = [];
+    for (var k = 1; k <= 10; k++) { var a = G.holeDeg(k) * Math.PI / 180; holes.push([c0 + Math.sin(a) * 21.5, c0 - Math.cos(a) * 21.5]); }
+    for (y = 0; y < w; y++) for (x = 0; x < w; x++) {
+      i = y * w + x; var r = Math.hypot(x + 0.5 - c0, y + 0.5 - c0);
+      if (r > 29.5) continue;
+      var hh = 2.2 * (1 - Math.pow(r / 29.5, 8)) + 1.2 * sm(26, 29, r) * 0, inHole = false;
+      for (var j = 0; j < 10; j++) {
+        var hd = Math.hypot(x + 0.5 - holes[j][0], y + 0.5 - holes[j][1]);
+        if (hd < 4.3) inHole = true; else if (hd < 6.2) hh += 1.6 * Math.sin((6.2 - hd) / 1.9 * Math.PI / 2);
+      }
+      if (inHole) continue;
+      if (r > 27) hh -= (r - 27) * 0.5;
+      if (r < 7.4) { m[i] = 2; hh += 1.5; } else m[i] = 1;
+      hf[i] = hh;
+    }
+    var im = new ImageData(w, w), o = im.data;
+    for (y = 0; y < w; y++) for (x = 0; x < w; x++) {
+      i = y * w + x; if (!m[i]) continue;
+      var n = nrm(hf, w, w, x, y, 1.2), c, r2 = Math.hypot(x + 0.5 - c0, y + 0.5 - c0);
+      if (m[i] === 2) { var v = 0.92 - 0.3 * sm(5.2, 7.4, r2); c = [236 * v, 226 * v, 200 * v]; }
+      else {
+        c = chrome(n, 0.62); var br = 0.88 + 0.24 * hash(Math.floor(r2 * 1.7), 3);
+        var ang = Math.atan2(y - c0, x - c0), cone = 0.5 + 0.5 * Math.cos(2 * (ang + 0.9));
+        var f = br * (0.55 + 0.7 * cone); c = [c[0] * f, c[1] * f, c[2] * f * 1.03];
+      }
+      var g = (hash(x, y) - 0.5) * 8;
+      o[i * 4] = clamp(c[0] + g, 0, 255); o[i * 4 + 1] = clamp(c[1] + g, 0, 255); o[i * 4 + 2] = clamp(c[2] + g, 0, 255); o[i * 4 + 3] = 255;
+    }
+    return toCanvas(w, w, im);
+  }
+
+  /* ---------- hook-switch plunger ---------- */
+  function buildPlunger() {
+    var cv = document.createElement('canvas'); cv.width = 6; cv.height = 9; var c = cv.getContext('2d');
+    var g = c.createLinearGradient(0, 0, 6, 0); g.addColorStop(0, '#fff6dc'); g.addColorStop(0.5, '#d9ccaa'); g.addColorStop(1, '#8a7d5e');
+    c.fillStyle = g; c.fillRect(0, 0, 6, 9); c.fillStyle = 'rgba(255,255,255,.7)'; c.fillRect(1, 0, 1, 9);
+    return cv;
+  }
+
+  P.shade = {
+    build: function () { return { base: buildBase(), handset: buildHandset(), wheel: buildWheel(), plunger: buildPlunger() }; }
+  };
+})(window.P = window.P || {});
+
+</script>
+<script>
+/* Scene: the telephone itself. Handset physics, verlet cord, rotary dial mechanics and drawing. */
+(function (P) {
+  'use strict';
+  var G = P.G, W = G.W, DC = G.dial, spr = null, N = 26;
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+  function sm(e0, e1, x) { var t = clamp((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); }
+
+  var S = P.S = {
+    hs: { x: G.rest.x, y: G.rest.y, a: 0, vx: 0, vy: 0, tx: G.rest.x, ty: G.rest.y, ta: 0, mode: 'cradled', up: false, hold: { x: G.held.x, y: G.held.y, a: G.held.a }, off: { x: 0, y: 0 }, start: { x: 0, y: 0 }, moved: false, prev: 'cradled' },
+    wheel: { a: 0, digit: 0, grab: false, ret: false, valid: false, pulseAt: [], nextPulse: 0, last: 0, rt: 0, auto: null },
+    cord: [], tint: null, shake: 0, ringing: false, heavy: 1, time: 0, onHook: null, onDigit: null
+  };
+
+  function anchor() { var h = S.hs; return { x: h.x - Math.cos(h.a) * 62, y: h.y - Math.sin(h.a) * 62 + 2 }; }
+  function initCord() {
+    var a = anchor(), j = G.jack; S.cord = [];
+    for (var i = 0; i < N; i++) { var t = i / (N - 1), x = j.x + (a.x - j.x) * t, y = j.y + (a.y - j.y) * t + Math.sin(t * Math.PI) * 30; S.cord.push({ x: x, y: y, px: x, py: y }); }
+  }
+  function stepCord(dt) {
+    var c = S.cord, rest = G.cord / (N - 1), a = anchor(), j = G.jack, i, it, p;
+    var g = 0.42 * dt;
+    for (i = 1; i < N - 1; i++) {
+      p = c[i]; var vx = (p.x - p.px) * 0.985, vy = (p.y - p.py) * 0.985;
+      p.px = p.x; p.py = p.y; p.x += vx; p.y += vy + g;
+    }
+    for (it = 0; it < 8; it++) {
+      c[0].x = j.x; c[0].y = j.y; c[N - 1].x = a.x; c[N - 1].y = a.y;
+      for (i = 0; i < N - 1; i++) {
+        var p1 = c[i], p2 = c[i + 1], dx = p2.x - p1.x, dy = p2.y - p1.y, d = Math.sqrt(dx * dx + dy * dy) || 0.0001, df = (d - rest) / d * 0.5;
+        if (i > 0) { p1.x += dx * df; p1.y += dy * df; }
+        if (i < N - 2) { p2.x -= dx * df; p2.y -= dy * df; }
+      }
+      for (i = 1; i < N - 1; i++) if (c[i].y > G.floor) { c[i].y = G.floor; c[i].px = c[i].x * 0.2 + c[i].px * 0.8; }
+    }
+  }
+  function drawCord(c) {
+    var pts = S.cord, back = [], front = [], s = 0, i, k;
+    for (i = 0; i < pts.length - 1; i++) {
+      var a = pts[i], b = pts[i + 1], dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx * dx + dy * dy) || 1, nx = -dy / d, ny = dx / d, steps = Math.max(1, Math.round(d / 0.8));
+      for (k = 0; k < steps; k++) {
+        var f = k / steps, ph = s * 0.85, off = Math.sin(ph) * 2.1, cs = Math.cos(ph);
+        var px = a.x + dx * f + nx * off, py = a.y + dy * f + ny * off;
+        (cs > 0 ? front : back).push(px, py, cs);
+        s += d / steps;
+      }
+    }
+    c.fillStyle = '#5a090d';
+    for (i = 0; i < back.length; i += 3) c.fillRect(back[i] - 1, back[i + 1] - 1, 2, 2);
+    for (i = 0; i < front.length; i += 3) {
+      var v = front[i + 2];
+      c.fillStyle = v > 0.85 ? '#ff8f7c' : v > 0.4 ? '#d8282c' : '#a31419';
+      c.fillRect(front[i] - 1, front[i + 1] - 1, 2, 2);
+    }
+  }
+
+  function liftAmt() { var h = S.hs; return Math.hypot(h.x - G.rest.x, h.y - G.rest.y); }
+  function setUp(up) { if (S.hs.up === up) return; S.hs.up = up; if (S.onHook) S.onHook(up); }
+  function reach(x, y) {
+    var j = G.jack, dx = x - j.x, dy = y - j.y, d = Math.hypot(dx, dy), m = G.cord - 14;
+    if (d > m) { x = j.x + dx / d * m; y = j.y + dy / d * m; }
+    return { x: clamp(x, 18, 182), y: clamp(y, 14, 172) };
+  }
+  function updateHandset(dt) {
+    var h = S.hs, k = (h.mode === 'drag' ? 0.4 : 0.16) / S.heavy, f = 1 - Math.pow(1 - k, dt), px = h.x, py = h.y;
+    var tx, ty, ta;
+    if (h.mode === 'cradled') { tx = G.rest.x; ty = G.rest.y; ta = 0; }
+    else if (h.mode === 'held') { tx = h.hold.x + Math.sin(S.time * 0.9) * 0.8; ty = h.hold.y + Math.sin(S.time * 1.3) * 0.9; ta = h.hold.a + Math.sin(S.time * 1.1) * 0.025; }
+    else { tx = h.tx; ty = h.ty; ta = sm(0.25, 1, clamp(Math.hypot(h.tx - G.rest.x, h.ty - G.rest.y) / 55, 0, 1)) * G.held.a; }
+    var r = reach(tx, ty); tx = r.x; ty = r.y;
+    h.x += (tx - h.x) * f; h.y += (ty - h.y) * f;
+    h.vx = (h.x - px) / dt; h.vy = (h.y - py) / dt;
+    var swing = clamp(h.vx * 0.02, -0.35, 0.35);
+    h.a += ((ta + (h.mode === 'cradled' ? 0 : swing)) - h.a) * (1 - Math.pow(1 - 0.18 / S.heavy, dt));
+    if (S.ringing && h.mode === 'cradled') { h.x += (Math.random() - 0.5) * 1.8; h.y += (Math.random() - 0.5) * 1.0; h.a += (Math.random() - 0.5) * 0.02; }
+  }
+
+  /* ---------- rotary dial ---------- */
+  function angleAt(x, y) { return Math.atan2(x - DC.x, -(y - DC.y)) * 180 / Math.PI; }
+  function wrap(d) { while (d > 180) d -= 360; while (d < -180) d += 360; return d; }
+  function hitWheel(x, y) { var r = Math.hypot(x - DC.x, y - DC.y); return r > 5 && r < 34; }
+  function wheelGrab(x, y) {
+    var w = S.wheel; if (w.ret || w.grab || w.auto) return false;
+    var phi = angleAt(x, y), best = 0, bd = 999;
+    for (var n = 1; n <= 10; n++) { var d = Math.abs(wrap(phi - (G.holeDeg(n) + w.a))); if (d < bd) { bd = d; best = n; } }
+    if (bd > 24) return false;
+    w.grab = true; w.digit = best; w.last = phi; w.rt = 0; return true;
+  }
+  function wheelDrag(x, y) {
+    var w = S.wheel; if (!w.grab) return;
+    var phi = angleAt(x, y), d = wrap(phi - w.last), max = G.rot(w.digit), old = w.a;
+    w.last = phi; w.a = clamp(w.a + d, 0, max);
+    w.rt += Math.max(0, w.a - old);
+    while (w.rt > 9) { w.rt -= 9; P.audio.ratchet(1.4); }
+  }
+  function startReturn(digit, valid) {
+    var w = S.wheel, max = G.rot(digit);
+    w.ret = true; w.valid = valid; w.digit = digit; w.nextPulse = 0; w.rt = 0; w.pulseAt = [];
+    for (var k = 1; k <= digit; k++) w.pulseAt.push(max * (1 - k / digit));
+  }
+  function wheelRelease() {
+    var w = S.wheel; if (!w.grab) return;
+    w.grab = false;
+    var max = G.rot(w.digit);
+    if (w.a < 4) { w.a = 0; return; }
+    startReturn(w.digit, w.a >= max - 4);
+    if (!w.valid) w.pulseAt = [];
+  }
+  function autoDial(digits) {   // the phone dials by itself
+    var w = S.wheel, list = String(digits).split('').map(function (d) { return d === '0' ? 10 : +d; });
+    w.auto = { list: list, i: 0, phase: 'wait', t: 0 };
+  }
+  function updateWheel(dt) {
+    var w = S.wheel, au = w.auto;
+    if (au && !w.ret && !w.grab) {
+      var d = au.list[au.i];
+      if (d == null) { w.auto = null; }
+      else if (au.phase === 'wait') { au.t += dt; if (au.t > 22) { au.phase = 'pull'; au.t = 0; } }
+      else if (au.phase === 'pull') {
+        var max = G.rot(d); w.a = Math.min(max, w.a + 7 * dt); w.rt += 7 * dt; while (w.rt > 9) { w.rt -= 9; P.audio.ratchet(1.4); }
+        if (w.a >= max) { startReturn(d, true); au.i++; au.phase = 'wait'; au.t = 0; }
+      }
+    }
+    if (w.ret) {
+      var sp = 5.6 * dt; w.a -= sp; w.rt += sp;
+      while (w.rt > 6) { w.rt -= 6; P.audio.ratchet(1); }
+      while (w.nextPulse < w.pulseAt.length && w.a <= w.pulseAt[w.nextPulse]) { P.audio.tick(1); w.nextPulse++; }
+      if (w.a <= 0) { w.a = 0; w.ret = false; if (w.valid && S.onDigit) S.onDigit(w.digit === 10 ? '0' : String(w.digit)); }
+    }
+  }
+
+  /* ---------- handset interaction ---------- */
+  function hitHandset(x, y) {
+    var h = S.hs, c = Math.cos(h.a), s = Math.sin(h.a), dx = x - h.x, dy = y - h.y;
+    var lx = c * dx + s * dy, ly = -s * dx + c * dy;
+    return Math.abs(lx) < 76 && Math.abs(ly) < 20;
+  }
+  function dragStart(x, y) {
+    var h = S.hs; h.prev = h.mode; h.mode = 'drag'; h.off.x = x - h.x; h.off.y = y - h.y; h.start.x = x; h.start.y = y; h.moved = false;
+    h.tx = h.x; h.ty = h.y;
+  }
+  function dragMove(x, y) {
+    var h = S.hs; if (h.mode !== 'drag') return;
+    h.tx = x - h.off.x; h.ty = y - h.off.y;
+    if (Math.hypot(x - h.start.x, y - h.start.y) > 4) h.moved = true;
+    if (!h.up && liftAmt() > 12) { P.audio.pickup(); setUp(true); }
+  }
+  function dragEnd() {
+    var h = S.hs; if (h.mode !== 'drag') return;
+    if (!h.moved) {   // a tap toggles the hook
+      if (h.prev === 'cradled') { h.mode = 'held'; h.hold = { x: G.held.x, y: G.held.y, a: G.held.a }; P.audio.pickup(); setUp(true); }
+      else { h.mode = 'cradled'; P.audio.hangup(); setUp(false); }
+      return;
+    }
+    if (Math.hypot(h.x - G.rest.x, h.y - G.rest.y) < 24) { h.mode = 'cradled'; if (h.up) { P.audio.hangup(); setUp(false); } else P.audio.slide(); }
+    else {
+      var r = reach(h.tx, h.ty);
+      h.mode = 'held'; h.hold = { x: r.x, y: r.y, a: sm(0.25, 1, clamp(Math.hypot(r.x - G.rest.x, r.y - G.rest.y) / 55, 0, 1)) * G.held.a };
+      if (!h.up) { P.audio.pickup(); setUp(true); }
+    }
+  }
+  function forceHangup() { var h = S.hs; if (h.mode === 'drag') return; h.mode = 'cradled'; if (h.up) { P.audio.hangup(); setUp(false); } }
+
+  /* ---------- frame ---------- */
+  function build() {
+    spr = P.shade.build();
+    var rc = document.createElement('canvas'); rc.width = W; rc.height = 34; var c = rc.getContext('2d');
+    c.setTransform(1, 0, 0, -1, 0, 165); c.drawImage(spr.base, 0, 0);
+    c.setTransform(1, 0, 0, 1, 0, 0); c.globalCompositeOperation = 'destination-in';
+    var g = c.createLinearGradient(0, 0, 0, 34); g.addColorStop(0, 'rgba(0,0,0,0.3)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = g; c.fillRect(0, 0, W, 34);
+    spr.refl = rc; initCord();
+  }
+  function update(dt) {
+    S.time += dt / 60; S.shake *= Math.pow(0.9, dt);
+    updateHandset(dt); updateWheel(dt); stepCord(dt);
+  }
+  function draw(c) {
+    if (!spr) return;
+    c.clearRect(0, 0, W, W);
+    c.save();
+    if (S.shake > 0.05) c.translate((Math.random() - 0.5) * S.shake, (Math.random() - 0.5) * S.shake);
+    c.drawImage(spr.refl, 0, 166);
+    if (P.fx) P.fx.drawObjects(c, 'back');
+    drawCord(c);
+    c.drawImage(spr.base, 0, 0);
+    if (S.hs.up) { c.drawImage(spr.plunger, 92, 62); c.drawImage(spr.plunger, 102, 62); }
+    // finger wheel
+    c.save();
+    c.shadowColor = 'rgba(0,0,0,0.55)'; c.shadowBlur = 2; c.shadowOffsetX = 1; c.shadowOffsetY = 2;
+    c.translate(DC.x, DC.y); c.rotate(S.wheel.a * Math.PI / 180); c.drawImage(spr.wheel, -32, -32);
+    c.restore();
+    // handset
+    var h = S.hs, lift = liftAmt();
+    c.save();
+    c.shadowColor = 'rgba(0,0,0,0.6)'; c.shadowBlur = 2 + lift * 0.04; c.shadowOffsetX = 2 + lift * 0.05; c.shadowOffsetY = 3 + lift * 0.1;
+    c.translate(h.x, h.y); c.rotate(h.a); c.drawImage(spr.handset, -80, -24);
+    c.restore();
+    if (P.fx) P.fx.drawObjects(c, 'front');
+    if (S.tint) { c.globalCompositeOperation = 'source-atop'; c.fillStyle = S.tint; c.fillRect(0, 0, W, W); c.globalCompositeOperation = 'source-over'; }
+    c.restore();
+  }
+  S.setUp = setUp;
+  P.scene = {
+    init: build, update: update, draw: draw, hitHandset: hitHandset, hitWheel: hitWheel,
+    dragStart: dragStart, dragMove: dragMove, dragEnd: dragEnd,
+    wheelGrab: wheelGrab, wheelDrag: wheelDrag, wheelRelease: wheelRelease, autoDial: autoDial, forceHangup: forceHangup,
+    busy: function () { var w = S.wheel; return w.grab || w.ret || !!w.auto; }
+  };
+})(window.P = window.P || {});
+
+</script>
+<script>
+/* FX: backgrounds, objects around the phone, on-screen text, flashes, quirks. */
+(function (P) {
+  'use strict';
+  var bgc, bgx, ovc, ovx, scc, bw = 100, bh = 100, ps = 3, T = 0;
+  var cur = { mode: 'black', t0: 0 }, prev = null, persistMode = null, callBg = false;
+  var objs = [], texts = [], flashes = [], glitchUntil = 0, noiseCv = null, noiseCx = null, noiseT = 0;
+  var stars = [], parts = [], quirk = { flip: false, mirror: false, tilt: 0 };
+  function rnd(a, b) { return a + Math.random() * (b - a); }
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+
+  function resize(w, h, pixel) {
+    bw = Math.ceil(w / pixel); bh = Math.ceil(h / pixel); ps = pixel;
+    bgc.width = ovc.width = bw; bgc.height = ovc.height = bh;
+    bgc.style.width = ovc.style.width = (bw * pixel) + 'px'; bgc.style.height = ovc.style.height = (bh * pixel) + 'px';
+    noiseCv = document.createElement('canvas'); noiseCv.width = Math.ceil(bw / 2); noiseCv.height = Math.ceil(bh / 2); noiseCx = noiseCv.getContext('2d');
+    stars = []; for (var i = 0; i < 90; i++) stars.push({ x: Math.random(), y: Math.random() * 0.85, s: Math.random(), p: Math.random() * 6 });
+    parts = []; for (i = 0; i < 70; i++) parts.push({ x: Math.random(), y: Math.random(), v: 0.4 + Math.random() });
+  }
+  function init(bg, ov, sc) { bgc = bg; ovc = ov; scc = sc; bgx = bg.getContext('2d'); ovx = ov.getContext('2d'); var f = P.mem.flag('bg'); if (f) { cur = { mode: f, t0: -99 }; persistMode = f; } }
+
+  /* ---------- background modes ---------- */
+  function staticNoise(c, w, h, a) {
+    if (T - noiseT > 0.05) {
+      noiseT = T; var im = noiseCx.createImageData(noiseCv.width, noiseCv.height), d = im.data;
+      for (var i = 0; i < d.length; i += 4) { var v = Math.random() * 255; d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255; }
+      noiseCx.putImageData(im, 0, 0);
+    }
+    c.globalAlpha = a; c.drawImage(noiseCv, 0, 0, w, h); c.globalAlpha = 1;
+  }
+  var MODES = {
+    black: function (c, w, h) { c.fillStyle = '#000'; c.fillRect(0, 0, w, h); },
+    stars: function (c, w, h, t) {
+      c.fillStyle = '#000'; c.fillRect(0, 0, w, h);
+      stars.forEach(function (s) { var a = 0.35 + 0.65 * Math.abs(Math.sin(t * (0.4 + s.s) + s.p)); c.fillStyle = 'rgba(255,250,235,' + a * (0.3 + s.s * 0.7) + ')'; c.fillRect(Math.floor(s.x * w), Math.floor(s.y * h), 1, 1); });
+      var ph = (t * 0.12) % 1; if (ph < 0.08) { c.fillStyle = '#fff'; var k = ph / 0.08; c.fillRect(w * (0.8 - k * 0.5), h * (0.1 + k * 0.25), 3, 1); }
+    },
+    snow: function (c, w, h, t) {
+      var g = c.createLinearGradient(0, 0, 0, h); g.addColorStop(0, '#0b0f18'); g.addColorStop(1, '#1b2230'); c.fillStyle = g; c.fillRect(0, 0, w, h);
+      c.fillStyle = '#dfe8f5'; parts.forEach(function (p) { var x = (p.x + Math.sin(t * 0.5 + p.v * 9) * 0.02) * w, y = ((p.y + t * 0.04 * p.v) % 1) * h; c.fillRect(Math.floor(x), Math.floor(y), 1 + (p.v > 1 ? 1 : 0), 1 + (p.v > 1 ? 1 : 0)); });
+    },
+    rain: function (c, w, h, t) {
+      c.fillStyle = '#05070b'; c.fillRect(0, 0, w, h);
+      c.fillStyle = 'rgba(150,175,205,.55)'; parts.forEach(function (p) { var x = p.x * w, y = ((p.y + t * 1.3 * p.v) % 1) * h; c.fillRect(Math.floor(x), Math.floor(y), 1, 3 + Math.floor(p.v * 2)); });
+      if (Math.sin(t * 0.7) > 0.985 || Math.sin(t * 2.3) > 0.998) { c.fillStyle = 'rgba(200,215,255,.25)'; c.fillRect(0, 0, w, h); }
+    },
+    static: function (c, w, h, t) { c.fillStyle = '#000'; c.fillRect(0, 0, w, h); staticNoise(c, w, h, 0.9); },
+    dawn: function (c, w, h, t) {
+      var g = c.createLinearGradient(0, 0, 0, h); g.addColorStop(0, '#0a1030'); g.addColorStop(0.55, '#5a3a68'); g.addColorStop(0.85, '#e0845a'); g.addColorStop(1, '#ffc98a');
+      c.fillStyle = g; c.fillRect(0, 0, w, h);
+      c.fillStyle = '#ffe9b0'; c.beginPath(); c.arc(w * 0.5, h * 0.92, h * 0.09, 0, 7); c.fill();
+    },
+    grid: function (c, w, h, t) {
+      var hy = h * 0.55, g = c.createLinearGradient(0, 0, 0, hy); g.addColorStop(0, '#0a0220'); g.addColorStop(1, '#5a0f6e'); c.fillStyle = g; c.fillRect(0, 0, w, hy);
+      c.fillStyle = '#12021c'; c.fillRect(0, hy, w, h - hy);
+      var sg = c.createLinearGradient(0, hy - h * 0.25, 0, hy); sg.addColorStop(0, '#ffd34d'); sg.addColorStop(1, '#ff2e88');
+      c.save(); c.beginPath(); c.arc(w / 2, hy, h * 0.25, Math.PI, 0); c.clip(); c.fillStyle = sg; c.fillRect(0, 0, w, hy);
+      c.fillStyle = '#12021c'; for (var i = 1; i < 6; i++) c.fillRect(0, hy - i * h * 0.04, w, i * 0.7); c.restore();
+      c.strokeStyle = 'rgba(255,60,200,.8)'; c.lineWidth = 1;
+      for (i = -12; i <= 12; i++) { c.beginPath(); c.moveTo(w / 2 + i * 3, hy); c.lineTo(w / 2 + i * w * 0.12, h); c.stroke(); }
+      for (i = 0; i < 9; i++) { var z = (i + (t * 0.5) % 1) / 9, y = hy + (h - hy) * z * z; c.beginPath(); c.moveTo(0, y); c.lineTo(w, y); c.stroke(); }
+    },
+    fog: function (c, w, h, t) {
+      c.fillStyle = '#07090a'; c.fillRect(0, 0, w, h);
+      for (var i = 0; i < 6; i++) { var x = (Math.sin(t * 0.07 + i * 2) * 0.5 + 0.5) * w, y = (0.3 + 0.12 * i) * h, r = h * 0.5, g = c.createRadialGradient(x, y, 0, x, y, r); g.addColorStop(0, 'rgba(120,130,125,.22)'); g.addColorStop(1, 'rgba(120,130,125,0)'); c.fillStyle = g; c.fillRect(0, 0, w, h); }
+    },
+    void: function (c, w, h, t) {
+      c.fillStyle = '#000'; c.fillRect(0, 0, w, h); var p = 0.5 + 0.5 * Math.sin(t * 1.2), g = c.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, Math.max(w, h) * 0.7);
+      g.addColorStop(0, 'rgba(120,0,6,' + (0.35 + p * 0.25) + ')'); g.addColorStop(1, 'rgba(0,0,0,0)'); c.fillStyle = g; c.fillRect(0, 0, w, h);
+    },
+    sea: function (c, w, h, t) {
+      var hy = h * 0.5, g = c.createLinearGradient(0, 0, 0, hy); g.addColorStop(0, '#020510'); g.addColorStop(1, '#14233f'); c.fillStyle = g; c.fillRect(0, 0, w, hy);
+      c.fillStyle = '#04080f'; c.fillRect(0, hy, w, h - hy);
+      c.fillStyle = '#e8eefc'; c.beginPath(); c.arc(w * 0.72, h * 0.2, h * 0.04, 0, 7); c.fill();
+      for (var i = 0; i < 14; i++) { var y = hy + (i + 1) * (h - hy) / 15, wd = 6 + i * 3, x = w * 0.72 + Math.sin(t * 1.2 + i) * 4; c.fillStyle = 'rgba(210,225,255,' + (0.5 - i * 0.03) + ')'; c.fillRect(x - wd / 2, y, wd, 1); }
+    },
+    hill: function (c, w, h, t) {
+      var g = c.createLinearGradient(0, 0, 0, h * 0.7); g.addColorStop(0, '#2f6fd6'); g.addColorStop(1, '#9cc9f5'); c.fillStyle = g; c.fillRect(0, 0, w, h);
+      var hg = c.createLinearGradient(0, h * 0.6, 0, h); hg.addColorStop(0, '#6bb23a'); hg.addColorStop(1, '#2b6b1a'); c.fillStyle = hg; c.beginPath(); c.moveTo(0, h); c.lineTo(0, h * 0.72);
+      for (var x = 0; x <= w; x += 4) c.lineTo(x, h * 0.66 + Math.sin(x / w * 3.4 + 0.6) * h * 0.08); c.lineTo(w, h); c.fill();
+      c.fillStyle = 'rgba(255,255,255,.85)'; for (var i = 0; i < 4; i++) { var cx = ((t * 1.5 + i * w * 0.3) % (w + 40)) - 20, cy = h * (0.15 + i * 0.07); c.fillRect(cx, cy, 22, 4); c.fillRect(cx + 5, cy - 3, 12, 4); }
+    },
+    yellow: function (c, w, h, t) {
+      var fl = 0.92 + 0.08 * Math.sin(t * 40) * (Math.sin(t * 0.9) > 0.8 ? 2 : 0.2); c.fillStyle = 'rgb(' + (170 * fl | 0) + ',' + (150 * fl | 0) + ',' + (52 * fl | 0) + ')'; c.fillRect(0, 0, w, h);
+      c.fillStyle = 'rgba(80,70,20,.25)'; for (var x = 0; x < w; x += 9) c.fillRect(x, 0, 1, h);
+      c.fillStyle = 'rgba(0,0,0,.35)'; c.fillRect(0, h * 0.82, w, h);
+    },
+    matrix: function (c, w, h, t) {
+      c.fillStyle = 'rgba(0,12,4,1)'; c.fillRect(0, 0, w, h);
+      for (var x = 0; x < w; x += 4) { var s = (Math.sin(x * 12.9898) * 43758.5453) % 1, sp = 8 + Math.abs(s) * 18, y = ((t * sp + Math.abs(s) * h) % (h + 30)) - 10; for (var k = 0; k < 8; k++) { c.fillStyle = 'rgba(60,255,120,' + (1 - k / 8) * 0.7 + ')'; if (((x + k * 7) * 31 + Math.floor(t * 4)) % 3) c.fillRect(x, y - k * 3, 2, 2); } }
+    },
+    eclipse: function (c, w, h, t) {
+      c.fillStyle = '#000'; c.fillRect(0, 0, w, h); var x = w / 2, y = h * 0.3, r = Math.min(w, h) * 0.2, g = c.createRadialGradient(x, y, r * 0.95, x, y, r * 2.2);
+      g.addColorStop(0, 'rgba(255,240,210,.9)'); g.addColorStop(0.15, 'rgba(255,200,140,.35)'); g.addColorStop(1, 'rgba(255,160,90,0)'); c.fillStyle = g; c.fillRect(0, 0, w, h);
+      c.fillStyle = '#000'; c.beginPath(); c.arc(x, y, r, 0, 7); c.fill();
+    },
+    bars: function (c, w, h, t) {
+      var cols = ['#c0c0c0', '#c0c000', '#00c0c0', '#00c000', '#c000c0', '#c00000', '#0000c0'], bwid = w / 7; c.fillStyle = '#000'; c.fillRect(0, 0, w, h);
+      for (var i = 0; i < 7; i++) { c.fillStyle = cols[i]; c.fillRect(i * bwid, 0, bwid + 1, h * 0.7); } staticNoise(c, w, h, 0.18);
+    }
+  };
+  function setBg(mode, o) {
+    o = o || {}; if (!MODES[mode] || mode === cur.mode) return;
+    prev = cur; cur = { mode: mode, t0: T };
+    if (o.persist) { persistMode = mode; P.mem.flag('bg', mode === 'black' ? null : mode); callBg = false; }
+    else if (mode !== persistMode) callBg = true;
+  }
+  function resetBg() { if (callBg) { callBg = false; setBg(persistMode || 'black'); } }
+  function drawBg(c, w, h) {
+    var k = clamp((T - cur.t0) / 1.6, 0, 1);
+    if (prev && k < 1) { MODES[prev.mode](c, w, h, T); c.globalAlpha = k; MODES[cur.mode](c, w, h, T); c.globalAlpha = 1; }
+    else { prev = null; MODES[cur.mode](c, w, h, T); }
+  }
+
+  /* ---------- objects (drawn on the scene canvas, so they share its pixels) ---------- */
+  var OBJ = {
+    candle: { pass: 'back', draw: function (c, o, t) {
+      var x = o.x, y = o.y, fl = 0.8 + 0.2 * Math.sin(t * 17 + o.s) * Math.sin(t * 9);
+      var g = c.createRadialGradient(x, y - 10, 1, x, y - 10, 46 * fl); g.addColorStop(0, 'rgba(255,170,70,.35)'); g.addColorStop(1, 'rgba(255,120,30,0)'); c.fillStyle = g; c.fillRect(x - 50, y - 60, 100, 100);
+      var b = c.createLinearGradient(x - 4, 0, x + 4, 0); b.addColorStop(0, '#9a8f78'); b.addColorStop(0.45, '#f2ead2'); b.addColorStop(1, '#6e6552'); c.fillStyle = b; c.fillRect(x - 4, y - 16, 8, 18);
+      c.fillStyle = '#222'; c.fillRect(x, y - 19, 1, 3);
+      c.fillStyle = '#ffd36b'; c.beginPath(); c.ellipse(x + Math.sin(t * 6) * 0.4, y - 23, 2, 4 * fl, 0, 0, 7); c.fill(); c.fillStyle = '#fff6cc'; c.fillRect(x - 1, y - 24, 1, 2);
+    } },
+    envelope: { pass: 'front', draw: function (c, o) {
+      c.save(); c.translate(o.x, o.y); c.rotate(o.r || -0.18); c.shadowColor = 'rgba(0,0,0,.6)'; c.shadowBlur = 2; c.shadowOffsetY = 2;
+      var g = c.createLinearGradient(-14, -9, 14, 9); g.addColorStop(0, '#f1ecd9'); g.addColorStop(1, '#bdb597'); c.fillStyle = g; c.fillRect(-14, -9, 28, 18); c.shadowColor = 'transparent';
+      c.strokeStyle = 'rgba(90,80,50,.7)'; c.beginPath(); c.moveTo(-14, -9); c.lineTo(0, 2); c.lineTo(14, -9); c.stroke();
+      c.fillStyle = '#9b1b1b'; c.beginPath(); c.arc(0, 2, 2.4, 0, 7); c.fill(); c.restore();
+    } },
+    eyes: { pass: 'back', draw: function (c, o, t) {
+      var bl = (Math.sin(t * 0.7 + o.s) > 0.97) ? 0.15 : 1, a = clamp((t - o.t0) / 2, 0, 1) * (o.life ? clamp((o.t0 + o.life - t) / 1.5, 0, 1) : 1);
+      c.fillStyle = 'rgba(255,230,200,' + 0.85 * a + ')'; c.fillRect(o.x - 8, o.y, 3, 2 * bl + 0.5); c.fillRect(o.x + 5, o.y, 3, 2 * bl + 0.5);
+      c.fillStyle = 'rgba(255,40,30,' + 0.5 * a + ')'; c.fillRect(o.x - 8, o.y, 1, 1); c.fillRect(o.x + 5, o.y, 1, 1);
+    } },
+    moth: { pass: 'front', draw: function (c, o, t) {
+      var x = o.x + Math.sin(t * 1.3 + o.s) * 38 + Math.sin(t * 3.1) * 6, y = o.y + Math.cos(t * 1.7 + o.s) * 22, f = Math.sin(t * 40) > 0 ? 3 : 1;
+      c.fillStyle = '#cfc6b0'; c.fillRect(x - f, y, f, 2); c.fillRect(x + 1, y, f, 2); c.fillStyle = '#6a604c'; c.fillRect(x, y, 1, 3);
+    } },
+    clock: { pass: 'back', draw: function (c, o, t) {
+      var x = o.x, y = o.y, r = 10, g = c.createRadialGradient(x - 3, y - 3, 1, x, y, r); g.addColorStop(0, '#f6f1e2'); g.addColorStop(1, '#a89f86');
+      c.fillStyle = '#1a1a1a'; c.beginPath(); c.arc(x, y, r + 2, 0, 7); c.fill(); c.fillStyle = g; c.beginPath(); c.arc(x, y, r, 0, 7); c.fill();
+      c.strokeStyle = '#111'; var s = (o.fixed != null ? o.fixed : t) * 6.28 / 60;
+      c.beginPath(); c.moveTo(x, y); c.lineTo(x + Math.sin(s) * 8, y - Math.cos(s) * 8); c.stroke(); c.beginPath(); c.moveTo(x, y); c.lineTo(x + 5, y - 2); c.stroke();
+    } },
+    floppy: { pass: 'front', draw: function (c, o) {
+      c.save(); c.translate(o.x, o.y); c.rotate(o.r || 0.22); c.shadowColor = 'rgba(0,0,0,.6)'; c.shadowBlur = 2; c.shadowOffsetY = 2;
+      c.fillStyle = '#22262e'; c.fillRect(-11, -11, 22, 22); c.shadowColor = 'transparent'; c.fillStyle = '#b9bec7'; c.fillRect(-6, -11, 12, 8); c.fillStyle = '#222'; c.fillRect(2, -10, 2, 6); c.fillStyle = '#d8d2bd'; c.fillRect(-8, 1, 16, 9); c.restore();
+    } },
+    key: { pass: 'front', draw: function (c, o) {
+      c.save(); c.translate(o.x, o.y); c.rotate(o.r || 0.6); var g = c.createLinearGradient(0, -2, 0, 2); g.addColorStop(0, '#f1d98a'); g.addColorStop(1, '#8a6d22');
+      c.shadowColor = 'rgba(0,0,0,.6)'; c.shadowBlur = 2; c.shadowOffsetY = 2; c.fillStyle = g; c.fillRect(-2, -1, 16, 3); c.fillRect(10, 1, 2, 4); c.fillRect(13, 1, 2, 3); c.beginPath(); c.arc(-5, 0, 4.5, 0, 7); c.fill();
+      c.shadowColor = 'transparent'; c.fillStyle = '#000'; c.beginPath(); c.arc(-5, 0, 1.8, 0, 7); c.fill(); c.restore();
+    } },
+    cassette: { pass: 'front', draw: function (c, o) {
+      c.save(); c.translate(o.x, o.y); c.rotate(o.r || -0.1); c.shadowColor = 'rgba(0,0,0,.6)'; c.shadowBlur = 2; c.shadowOffsetY = 2; c.fillStyle = '#2b2b2b'; c.fillRect(-16, -10, 32, 20); c.shadowColor = 'transparent';
+      c.fillStyle = '#d9d4c4'; c.fillRect(-13, -8, 26, 9); c.fillStyle = '#222'; c.beginPath(); c.arc(-6, -3.5, 2.5, 0, 7); c.arc(6, -3.5, 2.5, 0, 7); c.fill(); c.fillStyle = '#555'; c.fillRect(-9, 4, 18, 4); c.restore();
+    } },
+    figure: { pass: 'back', draw: function (c, o, t) {
+      var a = clamp((t - o.t0) / 3, 0, 1) * 0.9; if (o.life) a *= clamp((o.t0 + o.life - t) / 1.5, 0, 1);
+      c.fillStyle = 'rgba(22,22,26,' + a + ')'; c.beginPath(); c.arc(o.x, o.y, 9, 0, 7); c.fill(); c.beginPath(); c.ellipse(o.x, o.y + 34, 24, 28, 0, 0, 7); c.fill();
+    } },
+    lamp: { pass: 'back', draw: function (c, o, t) {
+      var fl = 0.9 + 0.1 * Math.sin(t * 31) * (Math.sin(t * 0.4) > 0.9 ? 1 : 0.1), g = c.createRadialGradient(o.x, o.y, 2, o.x, o.y + 40, 110);
+      g.addColorStop(0, 'rgba(255,214,150,' + 0.38 * fl + ')'); g.addColorStop(1, 'rgba(255,190,110,0)'); c.fillStyle = g; c.fillRect(0, 0, 200, 200);
+      c.fillStyle = '#d8c79a'; c.fillRect(o.x - 4, o.y - 2, 8, 4);
+    } },
+    pizza: { pass: 'front', draw: function (c, o) {
+      c.save(); c.translate(o.x, o.y); c.rotate(o.r || 0.5); c.fillStyle = '#d9a441'; c.beginPath(); c.moveTo(0, 12); c.lineTo(-10, -10); c.lineTo(10, -10); c.fill(); c.fillStyle = '#e8c15c'; c.beginPath(); c.moveTo(0, 8); c.lineTo(-7, -7); c.lineTo(7, -7); c.fill();
+      c.fillStyle = '#b32a1e'; c.fillRect(-3, -3, 3, 3); c.fillRect(2, -6, 3, 3); c.fillRect(0, 2, 3, 3); c.restore();
+    } }
+  };
+  function addObj(kind, o) {
+    var d = OBJ[kind]; if (!d) return null; o = o || {};
+    var ob = { kind: kind, x: o.x != null ? o.x : 40 + Math.random() * 120, y: o.y != null ? o.y : 30 + Math.random() * 140, r: o.r, s: Math.random() * 9, t0: T, life: o.life || 0, persist: !!o.persist, fixed: o.fixed };
+    objs.push(ob); return ob;
+  }
+  function removeKind(k) { objs = objs.filter(function (o) { return o.kind !== k; }); }
+  function clearObjs(all) { objs = objs.filter(function (o) { return !all && o.persist; }); }
+  function drawObjects(c, pass) {
+    for (var i = objs.length - 1; i >= 0; i--) { var o = objs[i]; if (o.life && T > o.t0 + o.life) { objs.splice(i, 1); continue; } if (OBJ[o.kind].pass === pass) OBJ[o.kind].draw(c, o, T); }
+  }
+
+  /* ---------- text / flashes / quirks ---------- */
+  function caption(text, o) {
+    o = o || {};
+    texts.push({ text: text, t0: T, dur: o.dur || Math.max(2.2, text.length * 0.07), x: o.x, y: o.y != null ? o.y : 0.86, color: o.color || '#e8e8e8', size: o.size || 8, type: o.type });
+  }
+  function flash(color, ms) { flashes.push({ color: color || '#fff', t0: T, dur: (ms || 150) / 1000 }); }
+  function glitch(ms) { glitchUntil = T + ms / 1000; }
+  function applyTransform(extra) {
+    var t = [];
+    if (quirk.flip) t.push('rotate(180deg)'); if (quirk.mirror) t.push('scaleX(-1)'); if (quirk.tilt) t.push('rotate(' + quirk.tilt + 'deg)'); if (extra) t.push(extra);
+    scc.style.transform = t.join(' ');
+  }
+  function setQuirk(k, v) { quirk[k] = v; applyTransform(); }
+  function drawOverlay(c, w, h) {
+    c.clearRect(0, 0, w, h);
+    for (var i = flashes.length - 1; i >= 0; i--) { var f = flashes[i], k = (T - f.t0) / f.dur; if (k >= 1) { flashes.splice(i, 1); continue; } c.globalAlpha = 1 - k; c.fillStyle = f.color; c.fillRect(0, 0, w, h); c.globalAlpha = 1; }
+    c.textAlign = 'center'; c.textBaseline = 'middle';
+    for (i = texts.length - 1; i >= 0; i--) {
+      var t = texts[i], age = T - t.t0; if (age > t.dur) { texts.splice(i, 1); continue; }
+      var a = Math.min(1, age / 0.4, (t.dur - age) / 0.6), shown = t.type ? t.text.slice(0, Math.floor(age * 14)) : t.text;
+      c.font = 'bold ' + t.size + 'px "Courier New", monospace'; c.globalAlpha = a;
+      var words = shown.split(' '), lines = [], ln = '', maxw = w * 0.84;
+      words.forEach(function (wd) { var test = ln ? ln + ' ' + wd : wd; if (c.measureText(test).width > maxw && ln) { lines.push(ln); ln = wd; } else ln = test; }); lines.push(ln);
+      var cx = (t.x != null ? t.x : 0.5) * w, cy = t.y * h - (lines.length - 1) * t.size * 0.6;
+      lines.forEach(function (l, j) { c.fillStyle = '#000'; c.fillText(l, cx + 1, cy + j * t.size * 1.3 + 1); c.fillStyle = t.color; c.fillText(l, cx, cy + j * t.size * 1.3); });
+      c.globalAlpha = 1;
+    }
+    if (T < glitchUntil) {
+      for (i = 0; i < 6; i++) { c.fillStyle = Math.random() < 0.5 ? 'rgba(255,255,255,.18)' : 'rgba(255,0,60,.2)'; c.fillRect(0, Math.random() * h, w, 1 + Math.random() * 3); }
+      applyTransform('translate(' + ((Math.random() - 0.5) * 10 | 0) + 'px,' + ((Math.random() - 0.5) * 4 | 0) + 'px)');
+    } else if (glitchUntil > 0) { glitchUntil = 0; applyTransform(); }
+    if (P.S.dim > 0.01) { c.fillStyle = 'rgba(0,0,0,' + P.S.dim + ')'; c.fillRect(0, 0, w, h); }
+  }
+  function frame(t) {
+    T = t; if (!bgx) return;
+    drawBg(bgx, bw, bh); drawOverlay(ovx, bw, bh);
+  }
+  function endCall() { resetBg(); clearObjs(false); P.S.tint = null; P.S.dim = 0; P.S.heavy = 1; P.S.ringing = false; if (quirk.flip || quirk.mirror || quirk.tilt) { quirk.flip = quirk.mirror = false; quirk.tilt = 0; applyTransform(); } }
+  P.S.dim = 0;
+  P.fx = {
+    init: init, resize: resize, frame: frame, setBg: setBg, resetBg: resetBg, drawObjects: drawObjects, add: addObj, remove: removeKind, clear: clearObjs,
+    caption: caption, flash: flash, glitch: glitch, quirk: setQuirk, endCall: endCall, modes: Object.keys(MODES), objKinds: Object.keys(OBJ),
+    get quirks() { return quirk; }, get t() { return T; }, size: function () { return { w: bw, h: bh, ps: ps }; }
+  };
+})(window.P = window.P || {});
+
+</script>
+<script>
+/* Line: the telephone exchange. Collects digits, connects calls, runs number scripts, handles hang-ups.
+   To add a number: P.line.def('5551234', function (c) { ... })  -- see numbers-a.js for the helpers on `c`.
+   To add a secret sequence: P.line.combo(['111','222'], function (c) { ... }) */
+(function (P) {
+  'use strict';
+  var A = P.audio, M = P.mem;
+  var defs = {}, combos = [], pickupHooks = [], idleHooks = [];
+  var L = { buf: '', up: false, id: 0, state: 'down', tone: null, timer: null, call: null, digitHook: null, ringing: null, last: 0 };
+  var ABORT = { abort: true };
+
+  function def(num, run, o) { defs[num] = { run: run, o: o || {} }; }
+  function combo(seq, run, o) { combos.push({ seq: seq, run: run, o: o || {} }); }
+  function prefixed(buf) { for (var k in defs) if (k.length > buf.length && k.indexOf(buf) === 0) return true; return false; }
+
+  function stopTone() { if (L.tone) { L.tone.stop(); L.tone = null; } }
+  function setTone(h) { stopTone(); L.tone = h; }
+  function alive(id) { return L.id === id && L.up; }
+
+  function makeCtx(num, n, id, o) {
+    var c = {
+      num: num, n: n, id: id, mem: M, fx: P.fx, audio: A, S: P.S, first: n === 1, o: o || {},
+      alive: function () { return alive(id); },
+      check: function () { if (!alive(id)) throw ABORT; },
+      wait: function (ms) { return new Promise(function (r) { setTimeout(function () { if (!alive(id)) { r(); } else r(); }, ms); }).then(function () { c.check(); }); },
+      say: function (t, opt) { c.check(); return A.say(t, opt).then(function () { c.check(); }); },
+      cap: function (t, opt) { P.fx.caption(t, opt); },
+      chance: function (p) { return Math.random() < p; },
+      pick: function (a) { return a[Math.floor(Math.random() * a.length)]; },
+      hold: function (h) { return h; },
+      hangup: function () { P.scene.forceHangup(); throw ABORT; },
+      end: function () { throw { end: true }; },
+      onDigit: function (fn) { L.digitHook = fn; },
+      since: function (x) { return M.sinceLast(x); },
+      prevCall: function () { return M.recent(1); },
+      wasCalled: function (x) { return M.count(x) > 0; }
+    };
+    return c;
+  }
+
+  function resolveRun(num) {
+    for (var i = 0; i < combos.length; i++) {
+      var cb = combos[i], k = cb.seq.length, last = M.lastCalls(k);
+      if (last.length === k && last.join('|') === cb.seq.join('|') && (!cb.o.once || !M.flag('combo' + i))) { if (cb.o.once) M.flag('combo' + i, 1); return cb; }
+    }
+    return defs[num] || { run: P.line.unknown, o: {} };
+  }
+
+  function ringSequence(id) {
+    var rings = 1 + (Math.random() < 0.55 ? 1 : 0) + (Math.random() < 0.2 ? 1 : 0), i = 0;
+    return new Promise(function (resolve) {
+      function next() {
+        if (!alive(id)) return resolve(false);
+        if (i >= rings) { stopTone(); return resolve(true); }
+        setTone(A.ringback()); i++;
+        L.timer = setTimeout(function () { stopTone(); L.timer = setTimeout(next, 1100); }, 1500);
+      }
+      L.timer = setTimeout(next, 450);
+    });
+  }
+
+  function connect(num) {
+    var id = L.id; L.state = 'ringing'; clearTimeout(L.timer); L.buf = '';
+    var def0 = defs[num];
+    ringSequence(id).then(function (ok) {
+      if (!ok || !alive(id)) return;
+      M.record(num); L.state = 'call';
+      var n = M.count(num), r = resolveRun(num), c = makeCtx(num, n, id, r.o);
+      L.call = c; L.digitHook = null;
+      A.click(0.6);
+      if (r.o.noLine !== true) c.hiss = A.hiss(0.012);
+      Promise.resolve().then(function () { return r.run(c); }).then(function () { finish(id); }, function (e) {
+        if (e === ABORT) return;
+        if (e && e.end) return finish(id);
+        if (window.console) console.warn(e); finish(id);
+      });
+    });
+  }
+
+  function finish(id) {
+    if (!alive(id)) return;
+    L.state = 'ended'; L.digitHook = null;
+    L.timer = setTimeout(function () {
+      if (!alive(id)) return;
+      A.click(0.5); P.fx.endCall();
+      setTone(Math.random() < 0.5 ? A.busy() : A.reorder());
+      L.timer = setTimeout(function () { if (alive(id)) { stopTone(); L.state = 'idle'; } }, 9000);
+    }, 1400);
+  }
+
+  function digit(d) {
+    if (!L.up) return;
+    if (L.state === 'call' || L.state === 'ended') {
+      if (L.digitHook) { var h = L.digitHook; h(d); return; }
+      if (L.state === 'ended') { stopTone(); P.fx.endCall(); L.state = 'dialing'; L.buf = ''; } else return;
+    }
+    if (L.state === 'ringing') return;
+    stopTone(); clearTimeout(L.timer); L.state = 'dialing'; L.buf += d;
+    var b = L.buf, exact = !!defs[b], more = prefixed(b);
+    if (b.length >= 11 || (exact && !more)) return setTimeout(function () { if (L.state === 'dialing' && L.buf === b) connect(b); }, 650);
+    if (!more && !exact && b.length >= 7) return setTimeout(function () { if (L.state === 'dialing' && L.buf === b) connect(b); }, 650);
+    L.timer = setTimeout(function () { if (L.state === 'dialing' && L.buf === b) connect(b); }, exact || more ? 2600 : 3300);
+  }
+
+  function pickup() {
+    L.up = true; L.id++; L.buf = ''; L.state = 'tone'; var id = L.id; clearTimeout(L.timer);
+    if (L.ringing) { var rg = L.ringing; L.ringing = null; rg.h.stop(); P.S.ringing = false; clearTimeout(rg.t); return incoming(id, rg); }
+    L.timer = setTimeout(function () {
+      if (!alive(id) || L.state !== 'tone') return;
+      var run = null;
+      for (var i = 0; i < pickupHooks.length; i++) { var r = pickupHooks[i](); if (r) { run = r; break; } }
+      if (run) { L.state = 'call'; var c = makeCtx('pickup', 1, id, {}); L.call = c; Promise.resolve().then(function () { return run(c); }).then(function () { if (alive(id)) { L.state = 'tone'; setTone(A.dialTone()); } }, function (e) { if (e !== ABORT && window.console) console.warn(e); }); }
+      else setTone(A.dialTone());
+    }, 420);
+  }
+  function hangup() {
+    L.up = false; L.id++; clearTimeout(L.timer); L.state = 'down'; L.buf = ''; L.digitHook = null; L.call = null;
+    stopTone(); A.killAll(); P.fx.endCall(); L.last = Date.now();
+    L.timer = setTimeout(function () { L.state = 'down'; }, 10);
+  }
+  function incoming(id, rg) {
+    L.state = 'call'; var c = makeCtx('incoming', 1, id, {}); L.call = c;
+    Promise.resolve().then(function () { return P.line.incomingRun(c, rg); }).then(function () { finish(id); }, function (e) { if (e !== ABORT && window.console) console.warn(e); });
+  }
+  function ringNow(why, ms) {
+    if (L.up || L.ringing) return; var h = null, tm = null, n = 0;
+    function burst() { if (L.up) return; h = A.ring(1300); P.S.ringing = true; L.ringing.h = h; n++; tm = setTimeout(function () { P.S.ringing = false; if (n >= 7) { L.ringing = null; return; } L.ringing.t = setTimeout(burst, 1700); }, 1300); }
+    L.ringing = { h: { stop: function () { if (h) h.stop(); } }, t: null, why: why };
+    burst();
+  }
+  function idleTick() {
+    for (var i = 0; i < idleHooks.length; i++) idleHooks[i](L);
+  }
+
+  P.line = {
+    def: def, combo: combo, defs: defs, onPickup: function (fn) { pickupHooks.push(fn); }, onIdle: function (fn) { idleHooks.push(fn); },
+    digit: digit, pickup: pickup, hangup: hangup, ringNow: ringNow, idleTick: idleTick, state: L,
+    isRinging: function () { return !!L.ringing; },
+    unknown: function (c) { c.audio.sit(); return c.say('The number you have dialed is not in service.', { who: 'f', rate: 0.9 }); },
+    incomingRun: function (c) { return c.say('Hello?'); }
+  };
+})(window.P = window.P || {});
+
+</script>
+<script>
+/* Numbers A: the ones that remember you, plus classics and internet culture.
+   Helpers on `c`: say, wait, cap, chance, pick, hangup, end, n (times called), wasCalled(num), since(num), prevCall(), audio, fx, S, mem.
+   Voices: who = f | m | kid | old | robot | whisper | deep ; lang = en | pt */
+(function (P) {
+  'use strict';
+  var def = P.line.def, M = P.mem, A = P.audio;
+  function days(ms) { return Math.round(ms / 864e5); }
+
+  /* 0 - the operator */
+  def('0', function (c) {
+    if (c.n === 1) { return c.say('Operator. How may I direct your call?').then(function () { return c.wait(3000); }).then(function () { return c.say('Hello?'); }); }
+    if (c.n === 2) return c.say('You again. I still cannot tell you the numbers.');
+    if (c.n === 3) return c.say('Listen. Some of them only answer if you have called the right ones first.', { who: 'whisper' });
+    if (c.n < 7) return c.wait(2500).then(function () { return c.say('Operator.', { who: 'f', rate: 0.8 }); });
+    return c.say('I have been told to stop answering.', { who: 'whisper' }).then(function () { A.click(1); c.hangup(); });
+  });
+
+  /* 5550137 - the one who waits. Remembers everything. */
+  def('5550137', function (c) {
+    var n = c.n, d = M.daysAway();
+    if (n === 1) return c.say('Hello? ...Sorry. I think you have the wrong number.', { who: 'old' });
+    if (n === 2) return c.wait(1500).then(function () { return c.say('Hello? Is someone there? I can hear you breathing.', { who: 'old' }); });
+    if (n === 3) return c.say('Oh... you are back.', { who: 'old', rate: 0.7 });
+    if (n === 4) return c.say('I thought you would not call again.', { who: 'old' });
+    var lines = [];
+    if (M.count('666') > 0) lines.push('You have been calling other people. Some of them are not nice.');
+    if (M.count('4004') > 0) lines.push('Your grandmother says hello. I did not know you had one.');
+    if (M.count('1313') > 0) lines.push('You called the child. Do not call the child.');
+    if (d > 1) lines.push('It has been ' + days(d * 864e5) + ' days. I counted.');
+    if (M.visits > 4) lines.push('This is your ' + M.visits + 'th time here. Nobody comes that often.');
+    lines.push('I turned the lamp on for you.');
+    if (n >= 8) { c.fx.add('lamp', { x: 140, y: 40, persist: true }); if (!M.flag('lamp')) M.flag('lamp', 1); return c.say(c.pick(lines.slice(-2)) + ' Stay as long as you like.', { who: 'old', rate: 0.75 }); }
+    return c.say(c.pick(lines), { who: 'old', rate: 0.8 });
+  });
+  P.line.onPickup(function () { return null; });
+
+  /* 1313 - a child */
+  def('1313', function (c) {
+    c.fx.setBg('fog');
+    if (c.n === 1) return c.say('Hi! Are you my mommy?', { who: 'kid' }).then(function () { return c.wait(1800); }).then(function () { return c.say('No. You sound different.', { who: 'kid' }); });
+    if (c.n === 2) return c.say('I am not supposed to talk to you. She said you would call again.', { who: 'kid' });
+    c.fx.add('eyes', { x: 100, y: 28, life: 9 });
+    if (c.n === 3) return c.say('I can see your phone from here.', { who: 'kid', rate: 0.8 });
+    return c.say(c.pick(['Look behind the phone.', 'Count to ten. I will be done hiding.', 'The red one is my favorite too.']), { who: 'kid', rate: 0.8 });
+  });
+
+  /* 4004 - vovo (Portuguese) */
+  def('4004', function (c) {
+    var o = { who: 'old', lang: 'pt', rate: 0.8 };
+    if (c.n === 1) return c.say('Alô? Quem fala? ...Ah. Deve ser engano, meu filho.', o);
+    if (c.n === 2) return c.say('Alô? Ah, é você de novo. Você comeu alguma coisa hoje?', o);
+    if (c.n === 3) return c.say('Meu bem, que bom que ligou. A vovó fez bolo.', o);
+    if (M.count('5550137') > 0) return c.say('Tem um senhor que sempre atende de madrugada. Não fale com ele, meu filho.', o);
+    return c.say(c.pick(['Já tomou café?', 'Liga mais vezes. A casa fica quieta.', 'Cuidado com o escuro, viu?']), o);
+  });
+
+  /* 1020 - hora certa */
+  def('1020', function (c) {
+    var d = new Date(), h = d.getHours(), m = d.getMinutes(), o = { who: 'f', lang: 'pt' };
+    return c.say('Hora certa. ' + h + ' horas e ' + m + ' minutos.', o).then(function () { A.sweep(1000, 1000, 0.5, 0.15); return c.wait(900); }).then(function () {
+      if (c.n >= 3 && c.chance(0.5)) return c.say('O tempo está passando mais devagar aí.', { who: 'whisper', lang: 'pt' });
+    });
+  });
+
+  /* 0800 - hold forever */
+  def('0800', function (c) {
+    var o = { who: 'f', lang: 'pt' };
+    return c.say('Todos os nossos atendentes estão ocupados. Sua ligação é muito importante para nós.', o).then(function () {
+      var h = A.musicBox([72, 76, 79, 76, 72, 79, 76, 72, 74, 77, 81, 77, 74, 81, 77, 74], 330, 0.1); return c.wait(c.n > 2 ? 20000 : 11000);
+    }).then(function () { return c.say(c.n > 2 ? 'Você é o número um da fila. Há quatro anos.' : 'Você é o número quarenta e dois na fila.', o); });
+  });
+
+  /* 411 - directory */
+  def('411', function (c) {
+    return c.say('City and listing?', { who: 'f' }).then(function () { return c.wait(2800); }).then(function () {
+      if (c.n >= 3) return c.say('A listing has been created for you. It is unlisted.', { who: 'robot' });
+      return c.say('No listing found.', { who: 'robot' });
+    });
+  });
+
+  /* 8675309 - Jenny */
+  def('8675309', function (c) {
+    if (c.n === 1) return c.say('Jenny does not live here anymore.', { who: 'm' });
+    if (c.n === 2) return c.say('Stop writing her number on walls.', { who: 'm' });
+    return c.say('She said to tell you she changed her number. She did not say to what.', { who: 'm' });
+  });
+
+  /* 911 - pizza */
+  def('911', function (c) {
+    c.fx.add('pizza', { x: 58, y: 150, life: 10 });
+    return c.say('Hello. This is not an emergency line. This is a pizza line.', { who: 'm' }).then(function () { return c.say(c.n > 1 ? 'The usual?' : 'What toppings?', { who: 'm' }); });
+  });
+
+  /* 666 */
+  def('666', function (c) {
+    c.fx.setBg('void'); c.fx.glitch(600);
+    return c.say('You have reached the Department of Mild Inconvenience.', { who: 'deep' }).then(function () { return c.say('Your call is very important to us. Please hold.', { who: 'deep' }); })
+      .then(function () { A.drone([55, 82.4], 0.05); return c.wait(5000); }).then(function () { return c.say(c.n > 2 ? 'We know where you live. It is on the form.' : 'Thank you for holding. The department is closed.', { who: 'deep' }); });
+  });
+
+  /* 777 */
+  def('777', function (c) {
+    var i = 0;
+    return new Promise(function (r) { var iv = setInterval(function () { A.blip({ f: 600 + i * 90, dur: 0.05, gain: 0.1, type: 'square' }); i++; if (i > 12) { clearInterval(iv); r(); } }, 90); }).then(function () {
+      c.check(); c.fx.flash('#ffd34d', 400); [0, 120, 240, 360].forEach(function (t) { setTimeout(function () { A.bellPing(1.5); }, t); }); return c.wait(1400);
+    }).then(function () { return c.say(c.n > 3 ? 'Jackpot. Again. Nothing.' : 'Jackpot.', { who: 'robot' }); });
+  });
+
+  /* 1234 / 4242 / 1111111 / 0000000 - the ones that do (almost) nothing */
+  def('1234', function (c) { return c.say('That is the combination on my luggage.', { who: 'm' }); });
+  def('1111111', function (c) { return c.wait(9000); });
+  def('0000000', function (c) {
+    if (c.n < 10) return c.wait(5000);
+    return c.wait(6000).then(function () { return c.say('...hello?', { who: 'whisper', rate: 0.6 }); });
+  });
+
+  /* 3333333 - music box, degrades with every call */
+  def('3333333', function (c) {
+    var notes = [64, 62, 60, 62, 64, 64, 64, 62, 62, 62, 64, 67, 67];
+    var h = A.musicBox(notes.concat(notes), 520 + c.n * 20, 0.12, c.n > 2 ? 0.02 * c.n : 0);
+    return c.wait(14000).then(function () { if (c.n > 4) return c.say('Go to sleep.', { who: 'kid', rate: 0.7 }); });
+  });
+
+  /* 3141592 - pi */
+  def('3141592', function (c) {
+    var d = '314159265358979323846264338327950288'.split('').join(' ');
+    return c.say('Three point ' + d.slice(2), { who: 'robot', rate: 1.05 }).then(function () { return c.say('I lost count.', { who: 'robot' }); });
+  });
+
+  /* 4815162342 - the hatch. Wait 108 minutes. */
+  def('4815162342', function (c) {
+    A.modem(1400);
+    return c.wait(1800).then(function () {
+      var gap = c.since('4815162342');
+      if (c.n > 1 && gap < 108 * 60000) { c.cap('00:' + String(108 - Math.floor(gap / 60000)).padStart(2, '0') + ' remaining', { dur: 4 }); return c.say('Too early.', { who: 'm' }); }
+      c.cap('108:00', { dur: 3.5 }); return c.say('Push the button.', { who: 'm' });
+    });
+  });
+
+  /* 2600 - blue box */
+  def('2600', function (c) {
+    A.sweep(2600, 2600, 1.1, 0.22);
+    return c.wait(1700).then(function () { c.fx.setBg('grid'); A.dtmf('9876', 0.1); return c.wait(900); }).then(function () { c.fx.glitch(300); return c.say('Trunk seized. Welcome to the network.', { who: 'robot' }); });
+  });
+
+  /* 1984 / 2001 / 404 */
+  def('1984', function (c) {
+    c.fx.setBg('static');
+    var t = ['WAR IS PEACE', 'FREEDOM IS SLAVERY', 'IGNORANCE IS STRENGTH'];
+    return c.say(c.pick(t) + '.', { who: 'robot' }).then(function () { return c.wait(500); }).then(function () { c.fx.caption('2 + 2 = 5', { color: '#ff4444' }); return c.wait(2500); });
+  });
+  def('2001', function (c) {
+    c.fx.setBg('void'); A.heartbeat(60, 0.25);
+    return c.say('Good evening. I am afraid I cannot do that.', { who: 'robot', rate: 0.7, pitch: 0.2 }).then(function () { return c.say(c.n > 1 ? 'I can still see you.' : 'This conversation can serve no purpose any more.', { who: 'robot', rate: 0.7, pitch: 0.2 }); });
+  });
+  def('404', function (c) { c.fx.caption('404', { size: 24, y: 0.2, dur: 5 }); return c.say('The number you have dialed could not be found.', { who: 'robot' }); });
+  def('1337', function (c) { c.fx.setBg('matrix'); return c.say('Wake up.', { who: 'whisper' }).then(function () { return c.wait(1500); }).then(function () { return c.say('Follow the white rabbit.', { who: 'whisper' }); }); });
+  def('5551212', function (c) { return c.say('Directory assistance has been replaced by a search engine. Please hang up and search.', { who: 'f' }); });
+})(window.P = window.P || {});
+
+</script>
+<script>
+/* Numbers B: visual events, rarities, secret sequences, unknown-number behaviour, idle ring-ins. */
+(function (P) {
+  'use strict';
+  var def = P.line.def, M = P.mem, A = P.audio;
+
+  def('5550100', function (c) {
+    c.fx.add('envelope', { x: 150, y: 150, persist: c.n > 2 }); A.slide();
+    return c.say(c.n === 1 ? 'Your letter has been delivered.' : 'Another letter. You should read them.', { who: 'f' });
+  });
+  def('7070707', function (c) {
+    c.fx.add('candle', { x: 38, y: 150, persist: c.n > 1 }); c.fx.setBg('black');
+    return c.say('Light a candle.', { who: 'whisper' }).then(function () { return c.wait(2500); });
+  });
+  def('1212121', function (c) {
+    c.fx.add('clock', { x: 160, y: 32, fixed: 10 * 5, persist: c.n > 1 });
+    return c.say('It is later than you think.', { who: 'old' });
+  });
+  def('8008', function (c) {
+    c.fx.add('floppy', { x: 52, y: 150, persist: c.n > 1 }); A.modem(5200);
+    return c.wait(5400).then(function () { return c.say('Insert disk two.', { who: 'robot' }); });
+  });
+  def('2468', function (c) { c.fx.add('key', { x: 150, y: 152, persist: true }); return c.say('Keep this somewhere safe. You will need it.', { who: 'whisper' }); });
+  def('1357', function (c) { c.fx.add('cassette', { x: 46, y: 148, persist: c.n > 1 }); A.crackle(0.3, 0.2); return c.say('This message was recorded on a tape. Please do not rewind.', { who: 'm', rate: 0.8 }); });
+  def('3030303', function (c) { for (var i = 0; i < 3; i++) c.fx.add('moth', { x: 100, y: 40 + i * 14, life: 40 }); return c.wait(6000); });
+  def('9999999', function (c) {
+    c.fx.setBg('yellow', { persist: c.n >= 3 });
+    return c.say(c.n < 3 ? 'If you are hearing this you have noclipped out of reality.' : 'You are not going back.', { who: 'robot', rate: 0.75 });
+  });
+  def('8888888', function (c) { c.fx.setBg('rain'); A.hiss(0.08, { f: 1400 }); return c.wait(8000).then(function () { return c.say('It never stops here.', { who: 'whisper' }); }); });
+  def('1999', function (c) { c.fx.setBg('hill'); A.musicBox([60, 64, 67, 72, 71, 67, 64, 67], 360, 0.1); return c.wait(5000); });
+  def('2112', function (c) { c.fx.setBg('stars'); return c.say('We have assumed control.', { who: 'deep' }); });
+  def('5550199', function (c) { return c.say('I am contractually unable to sing it. But I will never give you up.', { who: 'm' }); });
+
+  /* secret sequences: dial these in order and the phone changes its answer */
+  P.line.combo(['0', '5550137', '1313'], function (c) {
+    c.fx.setBg('eclipse', { persist: true }); A.boom(1); c.S.shake = 6;
+    return c.say('Everything you called is the same place.', { who: 'deep', rate: 0.7 });
+  }, { once: true });
+  P.line.combo(['4815162342', '2600'], function (c) {
+    c.fx.setBg('bars'); c.fx.quirk('flip', true);
+    return c.say('Orientation corrected.', { who: 'robot' });
+  }, { once: true });
+  P.line.combo(['1313', '4004', '1313'], function (c) {
+    c.fx.add('figure', { x: 100, y: 120, life: 12 }); c.fx.setBg('fog');
+    return c.say('Vovo says you should go to sleep now.', { who: 'kid', rate: 0.75 });
+  }, { once: true });
+
+  /* unknown numbers: deterministic by number, with a little luck */
+  function h(s) { var x = 0; for (var i = 0; i < s.length; i++) x = (x * 31 + s.charCodeAt(i)) >>> 0; return x; }
+  P.line.unknown = function (c) {
+    var k = (h(c.num) + (c.n > 3 ? c.n : 0)) % 9;
+    if (c.chance(0.02)) { c.fx.flash('#fff', 120); return c.say('...', { who: 'whisper' }); }
+    switch (k) {
+      case 0: A.sit(); return c.say('We are sorry. The number you have dialed is not in service.', { who: 'f' });
+      case 1: return new Promise(function (r) { var t = A.busy(); setTimeout(function () { t.stop(); r(); }, 5000); });
+      case 2: return c.wait(14000);
+      case 3: A.modem(3500); return c.wait(3800);
+      case 4: return c.say('Wrong number. Sorry.', { who: 'old' });
+      case 5: return c.say('Hello? Hello? I cannot hear you.', { who: 'm' }).then(function () { A.click(1); c.hangup(); });
+      case 6: return c.say(c.pick(['Please leave a message after the tone.', 'This mailbox is full.']), { who: 'f' }).then(function () { A.sweep(900, 900, 0.4, 0.15); return c.wait(4000); });
+      case 7: A.dtmf(c.num, 0.1); return c.wait(2500).then(function () { return c.say('The number you have dialed has been disconnected.', { who: 'f' }); });
+      default: return c.wait(1000).then(function () { c.hangup(); });
+    }
+  };
+
+  /* rare things on pickup */
+  P.line.onPickup(function () {
+    var r = Math.random();
+    if (M.visits > 2 && M.daysAway() > 3 && !M.flag('away' + Math.floor(M.daysAway()))) {
+      M.flag('away' + Math.floor(M.daysAway()), 1);
+      return function (c) { return c.wait(900).then(function () { return c.say('...you have been gone ' + Math.round(M.daysAway()) + ' days.', { who: 'whisper', rate: 0.7 }); }); };
+    }
+    if (r < 1 / 90) return function (c) { return c.say('...and then he said he would never come back.', { who: 'm' }).then(function () { return c.say('Hold on, someone is on the line.', { who: 'f' }); }); };
+    if (r < 1 / 60) return function (c) { A.crackle(0.4, 0.3); return c.wait(3500); };
+    if (r < 1 / 300) return function (c) { c.fx.setBg('eclipse', { persist: true }); return c.wait(500); };
+    return null;
+  });
+
+  /* the phone rings on its own once it has been used enough */
+  var next = Date.now() + 90000;
+  P.line.onIdle(function (L) {
+    if (L.up || L.ringing || Date.now() < next) return;
+    next = Date.now() + 120000 + Math.random() * 240000;
+    if (M.total() >= 2 && Math.random() < 0.3) P.line.ringNow('idle');
+  });
+  P.line.incomingRun = function (c) {
+    var top = null, best = 0; for (var k in M.data.counts) if (M.data.counts[k] > best) { best = M.data.counts[k]; top = k; }
+    return c.say('Hello?', { who: 'old' }).then(function () { return c.wait(1800); }).then(function () {
+      return c.say(top ? 'You keep calling ' + top.split('').join(' ') + '. Now I called you.' : 'Finally. Someone picked up.', { who: 'old', rate: 0.8 });
+    });
+  };
+})(window.P = window.P || {});
+
+</script>
+<script>
+/* Main: layout, input (mouse + touch), cursor, render loop. */
+(function (P) {
+  'use strict';
+  var W = P.G.W, st = document.getElementById('stage'), bg = document.getElementById('bg'), sc = document.getElementById('scene'), ov = document.getElementById('ov');
+  var sx = sc.getContext('2d'), px = 3, ox = 0, oy = 0, handCur = null, started = false, pointer = null, last = performance.now();
+
+  function layout() {
+    var w = st.clientWidth, h = st.clientHeight, u = Math.min(w / (W + 4), h / (W + 10), 5);
+    px = u; sc.width = W; sc.height = W; sc.style.width = W * u + 'px'; sc.style.height = W * u + 'px';
+    ox = Math.floor((w - W * u) / 2); oy = Math.floor((h - W * u) / 2 + h * 0.02);
+    sc.style.left = ox + 'px'; sc.style.top = oy + 'px';
+    P.fx.resize(w, h, Math.max(2, Math.round(u)));
+  }
+  function toScene(e) { var r = sc.getBoundingClientRect(); return { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * W }; }
+
+  function makeCursor(fist) {
+    var c = document.createElement('canvas'); c.width = 20; c.height = 20; var x = c.getContext('2d');
+    function r(a, b, w, h, col) { x.fillStyle = col; x.fillRect(a, b, w, h); }
+    var o = '#000', s = '#f1d3b0', d = '#c79a72';
+    if (!fist) { r(6, 1, 4, 10, o); r(7, 2, 2, 9, s); r(4, 9, 11, 9, o); r(5, 10, 9, 7, s); r(10, 6, 3, 5, o); r(11, 7, 1, 4, s); r(5, 16, 9, 1, d); }
+    else { r(3, 6, 13, 11, o); r(4, 7, 11, 9, s); r(4, 6, 11, 1, o); r(5, 9, 9, 1, d); r(5, 12, 9, 1, d); }
+    return 'url(' + c.toDataURL() + ') ' + (fist ? 10 : 8) + ' ' + (fist ? 10 : 2) + ', ' + (fist ? 'grabbing' : 'pointer');
+  }
+  var curA = makeCursor(false), curB = makeCursor(true);
+  function setCursor(v) { document.body.style.cursor = v; st.style.cursor = v; }
+
+  function down(e) {
+    if (!started) { P.audio.init(); started = true; }
+    P.audio.resume();
+    var p = toScene(e); pointer = { id: e.pointerId, mode: null };
+    try { st.setPointerCapture(e.pointerId); } catch (x) {}
+    if (P.scene.hitHandset(p.x, p.y)) { pointer.mode = 'handset'; P.scene.dragStart(p.x, p.y); setCursor(curB); }
+    else if (P.scene.hitWheel(p.x, p.y)) {
+      if (!P.S.hs.up) { P.audio.click(0.7); P.S.shake = 1.2; pointer.mode = 'none'; }
+      else if (P.scene.wheelGrab(p.x, p.y)) { pointer.mode = 'wheel'; setCursor(curB); }
+    }
+    e.preventDefault();
+  }
+  function move(e) {
+    var p = toScene(e);
+    if (pointer && pointer.id === e.pointerId) {
+      if (pointer.mode === 'handset') P.scene.dragMove(p.x, p.y);
+      else if (pointer.mode === 'wheel') P.scene.wheelDrag(p.x, p.y);
+    } else if (!pointer) {
+      var hot = P.scene.hitHandset(p.x, p.y) || P.scene.hitWheel(p.x, p.y);
+      setCursor(hot ? curA : curA);
+    }
+  }
+  function up(e) {
+    if (!pointer || pointer.id !== e.pointerId) return;
+    if (pointer.mode === 'handset') P.scene.dragEnd(); else if (pointer.mode === 'wheel') P.scene.wheelRelease();
+    pointer = null; setCursor(curA);
+  }
+  st.addEventListener('pointerdown', down); st.addEventListener('pointermove', move);
+  st.addEventListener('pointerup', up); st.addEventListener('pointercancel', up);
+  st.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  window.addEventListener('resize', layout);
+  window.addEventListener('orientationchange', function () { setTimeout(layout, 120); });
+  document.addEventListener('visibilitychange', function () { if (document.hidden) { try { speechSynthesis.pause(); } catch (e) {} } else { try { speechSynthesis.resume(); } catch (e) {} } });
+
+  P.S.onHook = function (up) { if (up) P.line.pickup(); else P.line.hangup(); };
+  P.S.onDigit = function (d) { P.line.digit(d); };
+
+  function frame(now) {
+    var dt = Math.min(3, (now - last) / 16.667); last = now;
+    P.scene.update(dt); P.scene.draw(sx); P.fx.frame(now / 1000);
+    requestAnimationFrame(frame);
+  }
+  function boot() {
+    setCursor(curA); P.scene.init(); P.fx.init(bg, ov, sc); layout();
+    setInterval(function () { P.line.idleTick(); }, 5000);
+    requestAnimationFrame(frame);
+  }
+  boot();
+})(window.P = window.P || {});
+
+</script>
+
+</body></html>
